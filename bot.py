@@ -39,6 +39,7 @@ PROXY_URL = os.getenv("PROXY_URL", "").strip()
 URL_CURRENCY = "https://alanchand.com/en/currencies-price"
 URL_CRYPTO = "https://alanchand.com/en/crypto-price"
 URL_GOLD = "https://alanchand.com/en/gold-price"
+URL_TGJU_DOLLAR = "https://www.tgju.org/profile/price_dollar_rl"
 
 HEADERS = {
     "User-Agent": (
@@ -160,38 +161,74 @@ async def get_rows(
 def parse_currency(
     rows: list[list[str]],
 ) -> dict:
+    """قیمت یورو را از الن‌چند می‌خواند؛ دلار از TGJU دریافت می‌شود."""
 
     output = {}
 
     for row in rows:
-
         if len(row) < 3:
             continue
 
         name = row[0].strip().lower()
 
-        if name in (
-            "us dollar",
-            "euro",
-        ):
-
+        if "euro" in name:
             buy = to_int(row[1])
             sell = to_int(row[2])
 
             if buy is not None and sell is not None:
-
-                output[name] = {
+                output["euro"] = {
                     "buy": buy // 10,
                     "sell": sell // 10,
                 }
 
-    if "us dollar" not in output:
-
-        raise ValueError(
-            "قیمت دلار پیدا نشد"
-        )
+    if not output:
+        raise ValueError("قیمت یورو پیدا نشد")
 
     return output
+
+
+async def get_tgju_dollar(session: aiohttp.ClientSession) -> int:
+    """قیمت دلار آزاد را از TGJU می‌خواند و از ریال به تومان تبدیل می‌کند."""
+
+    async with session.get(URL_TGJU_DOLLAR) as response:
+        response.raise_for_status()
+        html = await response.text()
+
+    soup = BeautifulSoup(html, "html.parser")
+
+    # انتخابگر اصلی قیمت در صفحه‌های پروفایل TGJU
+    candidates = []
+    for selector in (
+        "span.info-price",
+        ".info-price",
+        "[data-market-row] .value",
+    ):
+        for element in soup.select(selector):
+            value = to_int(element.get_text(" ", strip=True))
+            if value is not None:
+                candidates.append(value)
+
+        if candidates:
+            break
+
+    # روش جایگزین برای تغییرات احتمالی HTML
+    if not candidates:
+        page_text = soup.get_text(" ", strip=True)
+        match = re.search(
+            r"نرخ فعلی\s*:?\s*([\d,٬٫]+)",
+            page_text,
+            re.IGNORECASE,
+        )
+        if match:
+            value = to_int(match.group(1))
+            if value is not None:
+                candidates.append(value)
+
+    if not candidates:
+        raise ValueError("قیمت دلار در صفحه TGJU پیدا نشد")
+
+    # صفحه price_dollar_rl قیمت را به ریال نشان می‌دهد.
+    return candidates[0] // 10
 
 
 # =========================================================
@@ -281,11 +318,7 @@ def parse_gold(
 # =========================================================
 
 async def fetch_all() -> dict:
-
-    timeout = aiohttp.ClientTimeout(
-        total=20
-    )
-
+    timeout = aiohttp.ClientTimeout(total=25)
     connector = aiohttp.TCPConnector(
         limit=10,
         ttl_dns_cache=300,
@@ -296,84 +329,53 @@ async def fetch_all() -> dict:
         timeout=timeout,
         connector=connector,
     ) as session:
-
         results = await asyncio.gather(
-
-            get_rows(
-                session,
-                URL_CURRENCY,
-            ),
-
-            get_rows(
-                session,
-                URL_CRYPTO,
-            ),
-
-            get_rows(
-                session,
-                URL_GOLD,
-            ),
-
+            get_rows(session, URL_CURRENCY),
+            get_rows(session, URL_CRYPTO),
+            get_rows(session, URL_GOLD),
+            get_tgju_dollar(session),
             return_exceptions=True,
         )
 
     data = {}
-
     parsers = (
-
-        (
-            "currency",
-            parse_currency,
-        ),
-
-        (
-            "crypto",
-            parse_crypto,
-        ),
-
-        (
-            "gold",
-            parse_gold,
-        ),
+        ("currency", parse_currency),
+        ("crypto", parse_crypto),
+        ("gold", parse_gold),
     )
 
-    for (
-        key,
-        parser,
-    ), result in zip(
-        parsers,
-        results,
-    ):
-
+    for (key, parser), result in zip(parsers, results[:3]):
         try:
-
-            if isinstance(
-                result,
-                Exception,
-            ):
+            if isinstance(result, Exception):
                 raise result
-
             data[key] = parser(result)
-
         except Exception as error:
-
             logging.warning(
                 "%s failed: %s: %s",
                 key,
                 type(error).__name__,
                 error,
             )
-
             data[key] = None
 
-    if all(
-        value is None
-        for value in data.values()
-    ):
-
-        raise ValueError(
-            "هیچ قیمتی دریافت نشد"
+    try:
+        dollar_result = results[3]
+        if isinstance(dollar_result, Exception):
+            raise dollar_result
+        data["tgju_dollar"] = dollar_result
+    except Exception as error:
+        logging.warning(
+            "TGJU dollar failed: %s: %s",
+            type(error).__name__,
+            error,
         )
+        data["tgju_dollar"] = None
+
+    if all(
+        data.get(key) is None
+        for key in ("currency", "crypto", "gold", "tgju_dollar")
+    ):
+        raise ValueError("هیچ قیمتی دریافت نشد")
 
     return data
 
@@ -407,9 +409,7 @@ def build_text(
         or {}
     )
 
-    usd = currency.get(
-        "us dollar"
-    )
+    usd = data.get("tgju_dollar")
 
     eur = currency.get(
         "euro"
@@ -421,28 +421,18 @@ def build_text(
     ]
 
     # -------------------------
-    # DOLLAR
+    # DOLLAR - TGJU
     # -------------------------
 
-    if usd:
-
+    if usd is not None:
         lines.extend([
-            "💵 <b>دلار آمریکا</b>",
-            (
-                f"   خرید: "
-                f"<b>{usd['buy']:,}</b> تومان"
-            ),
-            (
-                f"   فروش: "
-                f"<b>{usd['sell']:,}</b> تومان"
-            ),
+            "💵 <b>دلار آزاد (TGJU)</b>",
+            f"   قیمت: <b>{usd:,}</b> تومان",
             "",
         ])
-
     else:
-
         lines.extend([
-            "💵 <b>دلار:</b> —",
+            "💵 <b>دلار آزاد (TGJU):</b> —",
             "",
         ])
 
@@ -559,7 +549,8 @@ def build_text(
     lines.extend([
         "",
         f"🕒 <b>آخرین دریافت:</b> {now}",
-        "📡 <b>منبع:</b> alanchand.com",
+        "📡 <b>منبع دلار:</b> tgju.org",
+        "📡 <b>منبع سایر قیمت‌ها:</b> alanchand.com",
         "",
         (
             "<i>قیمت‌ها ممکن است با "
