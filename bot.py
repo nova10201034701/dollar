@@ -188,47 +188,38 @@ def parse_currency(
 
 
 async def get_tgju_dollar(session: aiohttp.ClientSession) -> int:
-    """قیمت دلار آزاد را از TGJU می‌خواند و از ریال به تومان تبدیل می‌کند."""
+    """قیمت دلار آزاد را از متن «نرخ فعلی» در TGJU می‌خواند."""
 
     async with session.get(URL_TGJU_DOLLAR) as response:
         response.raise_for_status()
         html = await response.text()
 
     soup = BeautifulSoup(html, "html.parser")
+    page_text = soup.get_text(" ", strip=True)
 
-    # انتخابگر اصلی قیمت در صفحه‌های پروفایل TGJU
-    candidates = []
-    for selector in (
-        "span.info-price",
-        ".info-price",
-        "[data-market-row] .value",
-    ):
-        for element in soup.select(selector):
-            value = to_int(element.get_text(" ", strip=True))
-            if value is not None:
-                candidates.append(value)
+    # مهم: از info-price عمومی استفاده نمی‌کنیم؛ ممکن است متعلق به
+    # یک ابزارک دیگر باشد. عدد را مستقیماً پس از «نرخ فعلی» می‌خوانیم.
+    match = re.search(
+        r"نرخ\s*فعلی\s*[:：]+\s*([\d,٬٫]+)",
+        page_text,
+        re.IGNORECASE,
+    )
 
-        if candidates:
-            break
+    if not match:
+        raise ValueError("فیلد «نرخ فعلی» دلار در صفحه TGJU پیدا نشد")
 
-    # روش جایگزین برای تغییرات احتمالی HTML
-    if not candidates:
-        page_text = soup.get_text(" ", strip=True)
-        match = re.search(
-            r"نرخ فعلی\s*:?\s*([\d,٬٫]+)",
-            page_text,
-            re.IGNORECASE,
+    rial_price = to_int(match.group(1))
+
+    if rial_price is None:
+        raise ValueError("عدد نرخ فعلی دلار قابل خواندن نیست")
+
+    # در صفحه TGJU واحد پولی «ریال» است؛ تبدیل به تومان.
+    if rial_price < 1_000_000:
+        raise ValueError(
+            f"عدد دریافتی برای نرخ دلار غیرمنتظره است: {rial_price} ریال"
         )
-        if match:
-            value = to_int(match.group(1))
-            if value is not None:
-                candidates.append(value)
 
-    if not candidates:
-        raise ValueError("قیمت دلار در صفحه TGJU پیدا نشد")
-
-    # صفحه price_dollar_rl قیمت را به ریال نشان می‌دهد.
-    return candidates[0] // 10
+    return rial_price // 10
 
 
 # =========================================================
