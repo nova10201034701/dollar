@@ -163,7 +163,7 @@ async def update_and_get_prices(record_snapshot: bool = True) -> dict:
         "ounce": raw_data.get("gold", {}).get("ounce"),
     }
 
-    result_data = {"raw": raw_data, "comparison": {}}
+    result_data = {"raw": raw_data, "comparison": {}, "comparison_label": "۵ دقیقه قبل"}
     if db_pool is None:
         return result_data
 
@@ -231,6 +231,8 @@ async def update_and_get_prices(record_snapshot: bool = True) -> dict:
                         """,
                         symbol, numeric_val,
                     )
+        if not previous_snapshot:
+            result_data["comparison_label"] = "بدون سابقه"
         logging.info("مقایسه با snapshot قبلی انجام شد و snapshot جدید ثبت شد.")
 
     return result_data
@@ -553,14 +555,23 @@ async def run_web_server():
 
 
 async def scheduled_price_updater():
+    # زمان‌بندی بر اساس شروع هر چرخه تا فاصله‌ی snapshotها واقعاً نزدیک ۵ دقیقه باشد.
+    next_run = asyncio.get_running_loop().time() + 300
     while True:
         try:
-            await asyncio.sleep(300)  # هر ۵ دقیقه
-            logging.info("بررسی خودکار قیمت‌ها برای ثبت تغییرات...")
+            delay = max(0, next_run - asyncio.get_running_loop().time())
+            await asyncio.sleep(delay)
+            logging.info("بررسی خودکار قیمت‌ها برای مقایسه با snapshot پنج دقیقه قبل...")
             await update_and_get_prices(record_snapshot=True)
             logging.info("بررسی خودکار ۵ دقیقه‌ای به پایان رسید.")
+            next_run += 300
+
+            # اگر یک درخواست طولانی باعث عقب‌افتادن شد، زمان‌بندی را دوباره از همین لحظه تنظیم کن.
+            if next_run < asyncio.get_running_loop().time():
+                next_run = asyncio.get_running_loop().time() + 300
         except Exception as e:
             logging.error(f"خطا در تسک به‌روزرسانی خودکار: {e}")
+            next_run = asyncio.get_running_loop().time() + 300
 
 
 async def main():
