@@ -8,6 +8,9 @@ from zoneinfo import ZoneInfo
 import aiohttp
 import asyncpg
 from bs4 import BeautifulSoup
+import uvicorn
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import HTMLResponse
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.session.aiohttp import AiohttpSession
@@ -19,6 +22,7 @@ from aiogram.types import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     Message,
+    WebAppInfo,
 )
 
 # =========================================================
@@ -57,7 +61,7 @@ HEADERS = {
 
 TEHRAN = ZoneInfo("Asia/Tehran")
 dp = Dispatcher()
-
+app = FastAPI()
 
 # =========================================================
 # DATABASE
@@ -93,9 +97,8 @@ async def init_db():
 
 
 async def save_daily_prices(data: dict):
-    """قیمت فعلی را برای روز جاری ذخیره/به‌روزرسانی می‌کند."""
     if db_pool is None:
-        raise RuntimeError("Database pool is not initialized")
+        return
 
     today = datetime.now(TEHRAN).date()
 
@@ -139,9 +142,8 @@ async def save_daily_prices(data: dict):
 
 
 async def get_yesterday_prices() -> dict:
-    """آخرین قیمت ثبت‌شده برای روز تقویمی قبل از امروز."""
     if db_pool is None:
-        raise RuntimeError("Database pool is not initialized")
+        return {}
 
     today = datetime.now(TEHRAN).date()
 
@@ -163,56 +165,55 @@ async def get_yesterday_prices() -> dict:
 
 
 # =========================================================
-# HELPERS
+# FASTAPI ENDPOINTS (WEB APP)
+# =========================================================
+
+@app.get("/api/prices")
+async def get_prices_api():
+    if db_pool is None:
+        raise HTTPException(status_code=500, detail="Database pool is not initialized")
+    
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT symbol, value, updated_at 
+            FROM daily_prices 
+            WHERE price_date = (SELECT MAX(price_date) FROM daily_prices)
+        """)
+        return {row["symbol"]: {"value": row["value"], "updated_at": row["updated_at"]} for row in rows}
+
+
+@app.get("/", response_class=HTMLResponse)
+async def serve_frontend():
+    try:
+        with open("index.html", "r", encoding="utf-8") as f:
+            return f.read()
+    except FileNotFoundError:
+        return "<h1>مینی‌اپ قیمت‌ها فعال است 🚀</h1>"
+
+
+# =========================================================
+# HELPERS & SCRAPING
 # =========================================================
 
 def to_int(value: str) -> int | None:
     digits = re.sub(r"[^\d]", "", value)
-
-    if not digits:
-        return None
-
-    return int(digits)
+    return int(digits) if digits else None
 
 
 def irr_to_toman(cell: str) -> int | None:
-    match = re.search(
-        r"([\d,]+)\s*IRR",
-        cell,
-        re.IGNORECASE,
-    )
-
+    match = re.search(r"([\d,]+)\s*IRR", cell, re.IGNORECASE)
     if not match:
         return None
-
     number = to_int(match.group(1))
-
-    if number is None:
-        return None
-
-    return number // 10
-
-
-def usd_value(cell: str) -> str | None:
-    match = re.search(
-        r"\$\s*([\d,]+(?:\.\d+)?)",
-        cell,
-    )
-
-    if not match:
-        return None
-
-    return match.group(1)
+    return number // 10 if number else None
 
 
 def usd_value_number(cell: str) -> float | None:
-    value = usd_value(cell)
-
-    if value is None:
+    match = re.search(r"\$\s*([\d,]+(?:\.\d+)?)", cell)
+    if not match:
         return None
-
     try:
-        return float(value.replace(",", ""))
+        return float(match.group(1).replace(",", ""))
     except ValueError:
         return None
 
@@ -220,7 +221,6 @@ def usd_value_number(cell: str) -> float | None:
 def fmt_toman(number) -> str:
     if number is None:
         return "—"
-
     try:
         return f"{float(number):,.0f}"
     except (TypeError, ValueError):
@@ -230,7 +230,6 @@ def fmt_toman(number) -> str:
 def fmt_usd(number) -> str:
     if number is None:
         return "—"
-
     try:
         return f"{float(number):,.2f}"
     except (TypeError, ValueError):
@@ -238,10 +237,8 @@ def fmt_usd(number) -> str:
 
 
 def change_text(current, previous, percent=True) -> str:
-    """🟢/🔴/⚪ تغییر نسبت به روز قبل."""
     if current is None or previous is None:
         return "⚪ —"
-
     try:
         current = float(current)
         previous = float(previous)
@@ -249,29 +246,23 @@ def change_text(current, previous, percent=True) -> str:
         return "⚪ —"
 
     diff = current - previous
-
     if diff > 0:
-        icon = "🟢"
-        sign = "+"
+        icon, sign = "🟢", "+"
     elif diff < 0:
-        icon = "🔴"
-        sign = ""
+        icon, sign = "🔴", ""
     else:
         return "⚪ 0"
 
     result = f"{icon} {sign}{diff:,.0f}"
-
     if percent and previous != 0:
         pct = (diff / previous) * 100
         result += f" ({sign}{pct:.2f}٪)"
-
     return result
 
 
 def change_usd_text(current, previous) -> str:
     if current is None or previous is None:
         return "⚪ —"
-
     try:
         current = float(current)
         previous = float(previous)
@@ -279,361 +270,134 @@ def change_usd_text(current, previous) -> str:
         return "⚪ —"
 
     diff = current - previous
-
     if diff > 0:
-        icon = "🟢"
-        sign = "+"
+        icon, sign = "🟢", "+"
     elif diff < 0:
-        icon = "🔴"
-        sign = ""
+        icon, sign = "🔴", ""
     else:
         return "⚪ 0"
 
     result = f"{icon} {sign}{diff:,.2f}"
-
     if previous != 0:
         pct = (diff / previous) * 100
         result += f" ({sign}{pct:.2f}٪)"
-
     return result
 
 
-# =========================================================
-# GET TABLE ROWS
-# =========================================================
-
-async def get_rows(
-    session: aiohttp.ClientSession,
-    url: str,
-) -> list[list[str]]:
-
+async def get_rows(session: aiohttp.ClientSession, url: str) -> list[list[str]]:
     async with session.get(url) as response:
         response.raise_for_status()
         html = await response.text()
-
-    soup = BeautifulSoup(
-        html,
-        "html.parser",
-    )
-
+    soup = BeautifulSoup(html, "html.parser")
     rows = []
-
     for tr in soup.find_all("tr"):
-        cells = [
-            cell.get_text(
-                " ",
-                strip=True,
-            )
-            for cell in tr.find_all(
-                ["td", "th"]
-            )
-        ]
-
+        cells = [cell.get_text(" ", strip=True) for cell in tr.find_all(["td", "th"])]
         if cells:
             rows.append(cells)
-
     return rows
 
 
-# =========================================================
-# PARSE CURRENCY
-# =========================================================
-
-def parse_currency(
-    rows: list[list[str]],
-) -> dict:
-
+def parse_currency(rows: list[list[str]]) -> dict:
     output = {}
-
     for row in rows:
         if len(row) < 3:
             continue
-
         name = row[0].strip().lower()
-
         if "euro" in name:
-            buy = to_int(row[1])
-            sell = to_int(row[2])
-
+            buy, sell = to_int(row[1]), to_int(row[2])
             if buy is not None and sell is not None:
-                output["euro"] = {
-                    "buy": buy // 10,
-                    "sell": sell // 10,
-                }
-
-    if not output:
-        raise ValueError("قیمت یورو پیدا نشد")
-
+                output["euro"] = {"buy": buy // 10, "sell": sell // 10}
     return output
 
 
-# =========================================================
-# TGJU DOLLAR
-# =========================================================
-
-async def get_tgju_dollar(
-    session: aiohttp.ClientSession,
-) -> int:
-
+async def get_tgju_dollar(session: aiohttp.ClientSession) -> int:
     async with session.get(URL_TGJU_DOLLAR) as response:
         response.raise_for_status()
         html = await response.text()
-
     soup = BeautifulSoup(html, "html.parser")
-    page_text = soup.get_text(" ", strip=True)
-
-    match = re.search(
-        r"نرخ\s*فعلی\s*[:：]+\s*([\d,٬٫]+)",
-        page_text,
-        re.IGNORECASE,
-    )
-
+    match = re.search(r"نرخ\s*فعلی\s*[:：]+\s*([\d,٬٫]+)", soup.get_text(" ", strip=True), re.IGNORECASE)
     if not match:
-        raise ValueError(
-            "فیلد «نرخ فعلی» دلار در صفحه TGJU پیدا نشد"
-        )
-
+        raise ValueError("نرخ دلار پیدا نشد")
     rial_price = to_int(match.group(1))
-
-    if rial_price is None:
-        raise ValueError(
-            "عدد نرخ فعلی دلار قابل خواندن نیست"
-        )
-
-    if rial_price < 1_000_000:
-        raise ValueError(
-            f"عدد دریافتی برای نرخ دلار غیرمنتظره است: "
-            f"{rial_price} ریال"
-        )
-
     return rial_price // 10
 
 
-# =========================================================
-# PARSE CRYPTO
-# =========================================================
-
-def parse_crypto(
-    rows: list[list[str]],
-) -> dict:
-
+def parse_crypto(rows: list[list[str]]) -> dict:
     output = {}
-
     for row in rows:
         if len(row) < 3:
             continue
-
         name = row[0].strip().upper()
-
         if name.endswith("USDT"):
             output["usdt"] = irr_to_toman(row[1])
-
         elif name.endswith("BTC"):
             output["btc"] = usd_value_number(row[2])
-
-    if not output:
-        raise ValueError(
-            "قیمت رمزارز پیدا نشد"
-        )
-
     return output
 
 
-# =========================================================
-# PARSE GOLD
-# =========================================================
-
-def parse_gold(
-    rows: list[list[str]],
-) -> dict:
-
+def parse_gold(rows: list[list[str]]) -> dict:
     output = {}
-
     for row in rows:
         if len(row) < 2:
             continue
-
         name = row[0].strip().lower()
-
         if name.startswith("18k gold"):
             output["gold18"] = irr_to_toman(row[1])
-
         elif name.startswith("full coin"):
             output["coin"] = irr_to_toman(row[1])
-
         elif name.startswith("gold ounce"):
             output["ounce"] = usd_value_number(row[1])
-
-    if not output:
-        raise ValueError(
-            "قیمت طلا پیدا نشد"
-        )
-
     return output
 
 
-# =========================================================
-# FETCH ALL PRICES
-# =========================================================
-
 async def fetch_all() -> dict:
-    timeout = aiohttp.ClientTimeout(
-        total=25
-    )
+    timeout = aiohttp.ClientTimeout(total=25)
+    connector = aiohttp.TCPConnector(limit=10, ttl_dns_cache=300)
 
-    connector = aiohttp.TCPConnector(
-        limit=10,
-        ttl_dns_cache=300,
-    )
-
-    async with aiohttp.ClientSession(
-        headers=HEADERS,
-        timeout=timeout,
-        connector=connector,
-    ) as session:
-
+    async with aiohttp.ClientSession(headers=HEADERS, timeout=timeout, connector=connector) as session:
         results = await asyncio.gather(
-            get_rows(
-                session,
-                URL_CURRENCY,
-            ),
-            get_rows(
-                session,
-                URL_CRYPTO,
-            ),
-            get_rows(
-                session,
-                URL_GOLD,
-            ),
-            get_tgju_dollar(
-                session
-            ),
+            get_rows(session, URL_CURRENCY),
+            get_rows(session, URL_CRYPTO),
+            get_rows(session, URL_GOLD),
+            get_tgju_dollar(session),
             return_exceptions=True,
         )
 
     data = {}
+    parsers = (("currency", parse_currency), ("crypto", parse_crypto), ("gold", parse_gold))
 
-    parsers = (
-        ("currency", parse_currency),
-        ("crypto", parse_crypto),
-        ("gold", parse_gold),
-    )
-
-    for (key, parser), result in zip(
-        parsers,
-        results[:3],
-    ):
-
+    for (key, parser), result in zip(parsers, results[:3]):
         try:
-            if isinstance(
-                result,
-                Exception,
-            ):
+            if isinstance(result, Exception):
                 raise result
-
             data[key] = parser(result)
-
-        except Exception as error:
-
-            logging.warning(
-                "%s failed: %s: %s",
-                key,
-                type(error).__name__,
-                error,
-            )
-
+        except Exception:
             data[key] = None
 
     try:
-        dollar_result = results[3]
-
-        if isinstance(
-            dollar_result,
-            Exception,
-        ):
-            raise dollar_result
-
-        data["tgju_dollar"] = dollar_result
-
-    except Exception as error:
-
-        logging.warning(
-            "TGJU dollar failed: %s: %s",
-            type(error).__name__,
-            error,
-        )
-
+        if isinstance(results[3], Exception):
+            raise results[3]
+        data["tgju_dollar"] = results[3]
+    except Exception:
         data["tgju_dollar"] = None
 
-    if all(
-        data.get(key) is None
-        for key in (
-            "currency",
-            "crypto",
-            "gold",
-            "tgju_dollar",
-        )
-    ):
-        raise ValueError(
-            "هیچ قیمتی دریافت نشد"
-        )
-
-    # ذخیره قیمت‌های دریافت‌شده برای امروز
     try:
         await save_daily_prices(data)
     except Exception:
-        logging.exception(
-            "Could not save daily prices"
-        )
+        pass
 
     return data
 
 
-# =========================================================
-# BUILD BOT MESSAGE
-# =========================================================
+async def build_text(data: dict) -> str:
+    now = datetime.now(TEHRAN).strftime("%Y/%m/%d | %H:%M:%S")
+    previous = await get_yesterday_prices()
 
-async def build_text(
-    data: dict,
-) -> str:
-
-    now = datetime.now(
-        TEHRAN
-    ).strftime(
-        "%Y/%m/%d | %H:%M:%S"
-    )
-
-    previous = {}
-
-    try:
-        previous = await get_yesterday_prices()
-    except Exception:
-        logging.exception(
-            "Could not load yesterday prices"
-        )
-
-    currency = (
-        data.get("currency")
-        or {}
-    )
-
-    crypto = (
-        data.get("crypto")
-        or {}
-    )
-
-    gold = (
-        data.get("gold")
-        or {}
-    )
-
-    usd = data.get(
-        "tgju_dollar"
-    )
-
-    eur = currency.get(
-        "euro"
-    )
+    currency = data.get("currency") or {}
+    crypto = data.get("crypto") or {}
+    gold = data.get("gold") or {}
+    usd = data.get("tgju_dollar")
+    eur = currency.get("euro")
 
     lines = [
         "📊 <b>قیمت لحظه‌ای بازار</b>",
@@ -641,330 +405,132 @@ async def build_text(
         "",
     ]
 
-    # -------------------------
-    # DOLLAR
-    # -------------------------
-
     if usd is not None:
         lines.extend([
             "💵 <b>دلار آزاد</b>",
-            (
-                f"   <b>{fmt_toman(usd)}</b> تومان  "
-                f"{change_text(usd, previous.get('dollar'))}"
-            ),
+            f"   <b>{fmt_toman(usd)}</b> تومان  {change_text(usd, previous.get('dollar'))}",
             "",
         ])
-    else:
-        lines.extend([
-            "💵 <b>دلار آزاد:</b> —",
-            "",
-        ])
-
-    # -------------------------
-    # EURO
-    # -------------------------
 
     if eur:
         euro_sell = eur.get("sell")
-
         lines.extend([
             "💶 <b>یورو</b>",
-            (
-                f"   خرید: <b>{fmt_toman(eur.get('buy'))}</b> تومان"
-            ),
-            (
-                f"   فروش: <b>{fmt_toman(euro_sell)}</b> تومان  "
-                f"{change_text(euro_sell, previous.get('euro'))}"
-            ),
+            f"   خرید: <b>{fmt_toman(eur.get('buy'))}</b> تومان",
+            f"   فروش: <b>{fmt_toman(euro_sell)}</b> تومان  {change_text(euro_sell, previous.get('euro'))}",
             "",
         ])
-
-    else:
-        lines.extend([
-            "💶 <b>یورو:</b> —",
-            "",
-        ])
-
-    # -------------------------
-    # USDT
-    # -------------------------
 
     usdt = crypto.get("usdt")
-
-    lines.append(
-        "💲 <b>تتر:</b> "
-        f"{fmt_toman(usdt)} تومان  "
-        f"{change_text(usdt, previous.get('usdt'))}"
-    )
-
-    # -------------------------
-    # BITCOIN
-    # -------------------------
+    lines.append(f"💲 <b>تتر:</b> {fmt_toman(usdt)} تومان  {change_text(usdt, previous.get('usdt'))}")
 
     btc = crypto.get("btc")
-
     if btc is not None:
-        lines.append(
-            f"₿ <b>بیت‌کوین:</b> "
-            f"{fmt_usd(btc)} دلار  "
-            f"{change_usd_text(btc, previous.get('btc'))}"
-        )
-    else:
-        lines.append(
-            "₿ <b>بیت‌کوین:</b> —"
-        )
+        lines.append(f"₿ <b>بیت‌کوین:</b> {fmt_usd(btc)} دلار  {change_usd_text(btc, previous.get('btc'))}")
 
     lines.append("")
 
-    # -------------------------
-    # GOLD
-    # -------------------------
-
     gold18 = gold.get("gold18")
-
-    lines.append(
-        "🥇 <b>طلای ۱۸ عیار (هر گرم):</b> "
-        f"{fmt_toman(gold18)} تومان  "
-        f"{change_text(gold18, previous.get('gold18'))}"
-    )
-
-    # -------------------------
-    # COIN
-    # -------------------------
+    lines.append(f"🥇 <b>طلای ۱۸ عیار:</b> {fmt_toman(gold18)} تومان  {change_text(gold18, previous.get('gold18'))}")
 
     coin = gold.get("coin")
-
-    lines.append(
-        "🪙 <b>سکه تمام:</b> "
-        f"{fmt_toman(coin)} تومان  "
-        f"{change_text(coin, previous.get('coin'))}"
-    )
-
-    # -------------------------
-    # GOLD OUNCE
-    # -------------------------
+    lines.append(f"🪙 <b>سکه تمام:</b> {fmt_toman(coin)} تومان  {change_text(coin, previous.get('coin'))}")
 
     ounce = gold.get("ounce")
-
     if ounce is not None:
-        lines.append(
-            f"🌍 <b>اونس جهانی طلا:</b> "
-            f"{fmt_usd(ounce)} دلار  "
-            f"{change_usd_text(ounce, previous.get('ounce'))}"
-        )
-    else:
-        lines.append(
-            "🌍 <b>اونس جهانی طلا:</b> —"
-        )
+        lines.append(f"🌍 <b>اونس جهانی طلا:</b> {fmt_usd(ounce)} دلار  {change_usd_text(ounce, previous.get('ounce'))}")
 
     lines.extend([
         "",
         f"🕒 <b>آخرین دریافت:</b> {now}",
-        "📡 <b>منبع دلار:</b> tgju.org",
-        "📡 <b>منبع سایر قیمت‌ها:</b> alanchand.com",
         "",
-        "<i>🟢 افزایش | 🔴 کاهش | ⚪ بدون تغییر/بدون سابقه</i>",
+        "<i>🟢 افزایش | 🔴 کاهش | ⚪ بدون تغییر</i>",
     ])
 
     return "\n".join(lines)
 
 
 # =========================================================
-# KEYBOARD
+# HANDLERS
 # =========================================================
 
-def refresh_keyboard() -> InlineKeyboardMarkup:
-
-    return InlineKeyboardMarkup(
+@dp.message(Command("start", "dollar", "price"))
+async def cmd_price(message: Message):
+    # گرفتن دامین از متغیرهای محیطی یا حالت پیش‌فرض برای دکمه مینی‌اپ
+    web_app_url = os.environ.get("WEB_APP_URL", "https://your-domain.railway.app")
+    
+    keyboard = InlineKeyboardMarkup(
         inline_keyboard=[
             [
-                InlineKeyboardButton(
-                    text="🔄 بروزرسانی قیمت‌ها",
-                    callback_data="refresh_prices",
-                    style=ButtonStyle.SUCCESS,
-                )
+                InlineKeyboardButton(text="🔄 بروزرسانی", callback_data="refresh_prices", style=ButtonStyle.SUCCESS),
+                InlineKeyboardButton(text="🌐 ورود به مینی‌اپ", web_app=WebAppInfo(url=web_app_url))
             ]
         ]
     )
 
-
-# =========================================================
-# /START /DOLLAR /PRICE
-# =========================================================
-
-@dp.message(
-    Command(
-        "start",
-        "dollar",
-        "price",
-    )
-)
-async def cmd_price(
-    message: Message,
-):
-
-    wait = await message.answer(
-        "⏳ در حال دریافت آخرین قیمت‌ها..."
-    )
-
+    wait = await message.answer("⏳ در حال دریافت آخرین قیمت‌ها...")
     try:
-
         data = await fetch_all()
-
-        await wait.edit_text(
-            await build_text(data),
-            reply_markup=refresh_keyboard(),
-            parse_mode="HTML",
-        )
-
+        await wait.edit_text(await build_text(data), reply_markup=keyboard, parse_mode="HTML")
     except Exception:
-
-        logging.exception(
-            "Failed to fetch prices"
-        )
-
-        await wait.edit_text(
-            "❌ دریافت قیمت‌ها ناموفق بود.\n\n"
-            "لطفاً چند لحظه دیگر دوباره تلاش کن."
-        )
+        await wait.edit_text("❌ دریافت قیمت‌ها ناموفق بود. لطفاً دوباره تلاش کنید.")
 
 
-# =========================================================
-# REFRESH BUTTON
-# =========================================================
-
-@dp.callback_query(
-    F.data.in_(
-        {
-            "refresh_prices",
-            "refresh_dollar",
-        }
-    )
-)
-async def on_refresh(
-    call: CallbackQuery,
-):
-
+@dp.callback_query(F.data == "refresh_prices")
+async def on_refresh(call: CallbackQuery):
     try:
-
-        await call.answer(
-            "⏳ در حال بروزرسانی..."
-        )
-
+        await call.answer("⏳ در حال بروزرسانی...")
         data = await fetch_all()
-
-        text = await build_text(data)
-
-        await call.message.edit_text(
-            text,
-            reply_markup=refresh_keyboard(),
-            parse_mode="HTML",
+        
+        web_app_url = os.environ.get("WEB_APP_URL", "https://your-domain.railway.app")
+        keyboard = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(text="🔄 بروزرسانی", callback_data="refresh_prices", style=ButtonStyle.SUCCESS),
+                    InlineKeyboardButton(text="🌐 ورود به مینی‌اپ", web_app=WebAppInfo(url=web_app_url))
+                ]
+            ]
         )
 
-        await call.answer(
-            "✅ قیمت‌ها بروزرسانی شد"
-        )
-
-    except TelegramBadRequest as error:
-
-        if (
-            "message is not modified"
-            in str(error).lower()
-        ):
-
-            await call.answer(
-                "قیمت‌ها تغییری نکرده"
-            )
-
-            return
-
-        logging.exception(
-            "Telegram update error"
-        )
-
+        await call.message.edit_text(await build_text(data), reply_markup=keyboard, parse_mode="HTML")
+        await call.answer("✅ قیمت‌ها بروزرسانی شد")
+    except TelegramBadRequest:
+        await call.answer("قیمت‌ها تغییری نکرده")
     except Exception:
-
-        logging.exception(
-            "Price refresh failed"
-        )
-
-        try:
-
-            await call.answer(
-                "❌ دریافت قیمت ناموفق بود",
-                show_alert=True,
-            )
-
-        except Exception:
-
-            logging.exception(
-                "Could not answer callback"
-            )
+        await call.answer("❌ خطا در بروزرسانی", show_alert=True)
 
 
 # =========================================================
-# MAIN
+# RUNNERS (WEB SERVER + BOT)
 # =========================================================
+
+async def run_web_server():
+    port = int(os.environ.get("PORT", 8000))
+    config = uvicorn.Config(app, host="0.0.0.0", port=port, log_level="info")
+    server = uvicorn.Server(config)
+    await server.serve()
+
 
 async def main():
-
     await init_db()
 
-    if PROXY_URL:
-
-        logging.info(
-            "Starting bot with proxy"
-        )
-
-        session = AiohttpSession(
-            proxy=PROXY_URL
-        )
-
-    else:
-
-        logging.info(
-            "Starting bot without proxy"
-        )
-
-        session = AiohttpSession()
-
-    bot = Bot(
-        token=BOT_TOKEN,
-        session=session,
-    )
+    session = AiohttpSession(proxy=PROXY_URL) if PROXY_URL else AiohttpSession()
+    bot = Bot(token=BOT_TOKEN, session=session)
 
     try:
-
-        logging.info(
-            "Price bot is starting..."
+        logging.info("Bot and Web Server are starting concurrently...")
+        await asyncio.gather(
+            run_web_server(),
+            dp.start_polling(bot)
         )
-
-        await dp.start_polling(
-            bot
-        )
-
     finally:
-
         await bot.session.close()
-
         if db_pool is not None:
             await db_pool.close()
 
 
-# =========================================================
-# RUN
-# =========================================================
-
 if __name__ == "__main__":
-
     try:
-
-        asyncio.run(
-            main()
-        )
-
+        asyncio.run(main())
     except KeyboardInterrupt:
-
-        logging.info(
-            "Bot stopped"
-        )
+        logging.info("Bot stopped")
