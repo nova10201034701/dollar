@@ -63,6 +63,9 @@ TEHRAN = ZoneInfo("Asia/Tehran")
 dp = Dispatcher()
 app = FastAPI()
 
+# کش برای نگهداری قیمت‌های ۵ دقیقه قبل جهت مقایسه فوری
+last_prices_cache = {}
+
 # =========================================================
 # DATABASE
 # =========================================================
@@ -139,29 +142,6 @@ async def save_daily_prices(data: dict):
                 symbol,
                 numeric_value,
             )
-
-
-async def get_yesterday_prices() -> dict:
-    if db_pool is None:
-        return {}
-
-    today = datetime.now(TEHRAN).date()
-
-    rows = await db_pool.fetch(
-        """
-        SELECT symbol, value
-        FROM daily_prices
-        WHERE price_date < $1
-          AND price_date = (
-              SELECT MAX(price_date)
-              FROM daily_prices
-              WHERE price_date < $1
-          )
-        """,
-        today,
-    )
-
-    return {row["symbol"]: float(row["value"]) for row in rows}
 
 
 # =========================================================
@@ -390,55 +370,67 @@ async def fetch_all() -> dict:
 
 
 async def build_text(data: dict) -> str:
+    global last_prices_cache
     now = datetime.now(TEHRAN).strftime("%Y/%m/%d | %H:%M:%S")
-    previous = await get_yesterday_prices()
 
     currency = data.get("currency") or {}
     crypto = data.get("crypto") or {}
     gold = data.get("gold") or {}
     usd = data.get("tgju_dollar")
     eur = currency.get("euro")
+    euro_sell = eur.get("sell") if eur else None
+    usdt = crypto.get("usdt")
+    btc = crypto.get("btc")
+    gold18 = gold.get("gold18")
+    coin = gold.get("coin")
+    ounce = gold.get("ounce")
+
+    # مقایسه با قیمت ۵ دقیقه قبل (آپدیت قبلی)
+    prev_usd = last_prices_cache.get("dollar", usd)
+    prev_euro = last_prices_cache.get("euro", euro_sell)
+    prev_usdt = last_prices_cache.get("usdt", usdt)
+    prev_btc = last_prices_cache.get("btc", btc)
+    prev_gold18 = last_prices_cache.get("gold18", gold18)
+    prev_coin = last_prices_cache.get("coin", coin)
+    prev_ounce = last_prices_cache.get("ounce", ounce)
 
     lines = [
         "📊 <b>قیمت لحظه‌ای بازار</b>",
-        "<i>مقایسه با آخرین قیمت ثبت‌شده روز قبل</i>",
+        "<i>مقایسه با ۵ دقیقه قبل</i>",
         "",
     ]
 
     if usd is not None:
         lines.extend([
             "💵 <b>دلار آزاد</b>",
-            f"   <b>{fmt_toman(usd)}</b> تومان  {change_text(usd, previous.get('dollar'))}",
+            f"   <b>{fmt_toman(usd)}</b> تومان  {change_text(usd, prev_usd)}",
             "",
         ])
 
     if eur:
-        euro_sell = eur.get("sell")
         lines.extend([
             "💶 <b>یورو</b>",
             f"   خرید: <b>{fmt_toman(eur.get('buy'))}</b> تومان",
-            f"   فروش: <b>{fmt_toman(euro_sell)}</b> تومان  {change_text(euro_sell, previous.get('euro'))}",
+            f"   فروش: <b>{fmt_toman(euro_sell)}</b> تومان  {change_text(euro_sell, prev_euro)}",
             "",
         ])
 
-    usdt = crypto.get("usdt")
-    lines.append(f"💲 <b>تتر:</b> {fmt_toman(usdt)} تومان  {change_text(usdt, previous.get('usdt'))}")
+    if usdt is not None:
+        lines.append(f"💲 <b>تتر:</b> {fmt_toman(usdt)} تومان  {change_text(usdt, prev_usdt)}")
 
-    btc = crypto.get("btc")
     if btc is not None:
-        lines.append(f"₿ <b>بیت‌کوین:</b> {fmt_usd(btc)} دلار  {change_usd_text(btc, previous.get('btc'))}")
+        lines.append(f"₿ <b>بیت‌کوین:</b> {fmt_usd(btc)} دلار  {change_usd_text(btc, prev_btc)}")
 
     lines.append("")
 
-    gold18 = gold.get("gold18")
-    lines.append(f"🥇 <b>طلای ۱۸ عیار:</b> {fmt_toman(gold18)} تومان  {change_text(gold18, previous.get('gold18'))}")
+    if gold18 is not None:
+        lines.append(f"🥇 <b>طلای ۱۸ عیار:</b> {fmt_toman(gold18)} تومان  {change_text(gold18, prev_gold18)}")
 
-    coin = gold.get("coin")
-    lines.append(f"🪙 <b>سکه تمام:</b> {fmt_toman(coin)} تومان  {change_text(coin, previous.get('coin'))}")
+    if coin is not None:
+        lines.append(f"🪙 <b>سکه تمام:</b> {fmt_toman(coin)} تومان  {change_text(coin, prev_coin)}")
 
-    ounce = gold.get("ounce")
     if ounce is not None:
-        lines.append(f"🌍 <b>اونس جهانی طلا:</b> {fmt_usd(ounce)} دلار  {change_usd_text(ounce, previous.get('ounce'))}")
+        lines.append(f"🌍 <b>اونس جهانی طلا:</b> {fmt_usd(ounce)} دلار  {change_usd_text(ounce, prev_ounce)}")
 
     lines.extend([
         "",
@@ -446,6 +438,17 @@ async def build_text(data: dict) -> str:
         "",
         "<i>🟢 افزایش | 🔴 کاهش | ⚪ بدون تغییر</i>",
     ])
+
+    # ذخیره قیمت‌های فعلی به عنوان قیمت قبلی برای چک بعدی
+    last_prices_cache = {
+        "dollar": usd,
+        "euro": euro_sell,
+        "usdt": usdt,
+        "btc": btc,
+        "gold18": gold18,
+        "coin": coin,
+        "ounce": ounce,
+    }
 
     return "\n".join(lines)
 
@@ -516,7 +519,6 @@ async def run_web_server():
 async def scheduled_price_updater():
     while True:
         try:
-            # هر ۳۰۰ ثانیه (معادل ۵ دقیقه) یک‌بار قیمت‌ها به طور خودکار آپدیت می‌شوند
             await asyncio.sleep(300)
             logging.info("شروع به‌روزرسانی خودکار قیمت‌ها (هر ۵ دقیقه)...")
             await fetch_all()
