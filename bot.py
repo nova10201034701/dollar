@@ -6,6 +6,7 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 
 import aiohttp
+import asyncpg
 from bs4 import BeautifulSoup
 
 from aiogram import Bot, Dispatcher, F
@@ -20,7 +21,6 @@ from aiogram.types import (
     Message,
 )
 
-
 # =========================================================
 # CONFIG
 # =========================================================
@@ -31,10 +31,14 @@ logging.basicConfig(
 )
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
-
-# اختیاری:
-# اگر در Railway پروکسی نداری، این Variable را اصلاً نساز.
 PROXY_URL = os.getenv("PROXY_URL", "").strip()
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+
+if not DATABASE_URL:
+    raise RuntimeError(
+        "DATABASE_URL در Environment Variables تنظیم نشده است. "
+        "در Railway یک PostgreSQL اضافه کن."
+    )
 
 URL_CURRENCY = "https://alanchand.com/en/currencies-price"
 URL_CRYPTO = "https://alanchand.com/en/crypto-price"
@@ -51,7 +55,111 @@ HEADERS = {
     "Pragma": "no-cache",
 }
 
+TEHRAN = ZoneInfo("Asia/Tehran")
 dp = Dispatcher()
+
+
+# =========================================================
+# DATABASE
+# =========================================================
+
+db_pool: asyncpg.Pool | None = None
+
+
+async def init_db():
+    global db_pool
+
+    db_pool = await asyncpg.create_pool(
+        DATABASE_URL,
+        min_size=1,
+        max_size=5,
+        command_timeout=20,
+    )
+
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS daily_prices (
+                price_date DATE NOT NULL,
+                symbol TEXT NOT NULL,
+                value DOUBLE PRECISION NOT NULL,
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                PRIMARY KEY (price_date, symbol)
+            )
+            """
+        )
+
+    logging.info("PostgreSQL database is ready.")
+
+
+async def save_daily_prices(data: dict):
+    """قیمت فعلی را برای روز جاری ذخیره/به‌روزرسانی می‌کند."""
+    if db_pool is None:
+        raise RuntimeError("Database pool is not initialized")
+
+    today = datetime.now(TEHRAN).date()
+
+    prices = {
+        "dollar": data.get("tgju_dollar"),
+        "euro": (
+            data.get("currency", {}).get("euro", {}).get("sell")
+            if data.get("currency")
+            else None
+        ),
+        "usdt": data.get("crypto", {}).get("usdt"),
+        "btc": data.get("crypto", {}).get("btc"),
+        "gold18": data.get("gold", {}).get("gold18"),
+        "coin": data.get("gold", {}).get("coin"),
+        "ounce": data.get("gold", {}).get("ounce"),
+    }
+
+    async with db_pool.acquire() as conn:
+        for symbol, value in prices.items():
+            if value is None:
+                continue
+
+            try:
+                numeric_value = float(value)
+            except (TypeError, ValueError):
+                continue
+
+            await conn.execute(
+                """
+                INSERT INTO daily_prices (price_date, symbol, value, updated_at)
+                VALUES ($1, $2, $3, NOW())
+                ON CONFLICT (price_date, symbol)
+                DO UPDATE SET
+                    value = EXCLUDED.value,
+                    updated_at = NOW()
+                """,
+                today,
+                symbol,
+                numeric_value,
+            )
+
+
+async def get_yesterday_prices() -> dict:
+    """آخرین قیمت ثبت‌شده برای روز تقویمی قبل از امروز."""
+    if db_pool is None:
+        raise RuntimeError("Database pool is not initialized")
+
+    today = datetime.now(TEHRAN).date()
+
+    rows = await db_pool.fetch(
+        """
+        SELECT symbol, value
+        FROM daily_prices
+        WHERE price_date < $1
+          AND price_date = (
+              SELECT MAX(price_date)
+              FROM daily_prices
+              WHERE price_date < $1
+          )
+        """,
+        today,
+    )
+
+    return {row["symbol"]: float(row["value"]) for row in rows}
 
 
 # =========================================================
@@ -59,7 +167,6 @@ dp = Dispatcher()
 # =========================================================
 
 def to_int(value: str) -> int | None:
-    """تمام کاراکترهای غیرعددی را حذف و عدد را برمی‌گرداند."""
     digits = re.sub(r"[^\d]", "", value)
 
     if not digits:
@@ -69,11 +176,6 @@ def to_int(value: str) -> int | None:
 
 
 def irr_to_toman(cell: str) -> int | None:
-    """
-    مقدار IRR را از متن پیدا می‌کند
-    و ریال را به تومان تبدیل می‌کند.
-    """
-
     match = re.search(
         r"([\d,]+)\s*IRR",
         cell,
@@ -92,8 +194,6 @@ def irr_to_toman(cell: str) -> int | None:
 
 
 def usd_value(cell: str) -> str | None:
-    """قیمت دلاری مثل $123,456 را استخراج می‌کند."""
-
     match = re.search(
         r"\$\s*([\d,]+(?:\.\d+)?)",
         cell,
@@ -105,13 +205,97 @@ def usd_value(cell: str) -> str | None:
     return match.group(1)
 
 
-def fmt_toman(number: int | None) -> str:
-    """نمایش عدد به صورت سه‌رقمی."""
+def usd_value_number(cell: str) -> float | None:
+    value = usd_value(cell)
 
+    if value is None:
+        return None
+
+    try:
+        return float(value.replace(",", ""))
+    except ValueError:
+        return None
+
+
+def fmt_toman(number) -> str:
     if number is None:
         return "—"
 
-    return f"{number:,}"
+    try:
+        return f"{float(number):,.0f}"
+    except (TypeError, ValueError):
+        return "—"
+
+
+def fmt_usd(number) -> str:
+    if number is None:
+        return "—"
+
+    try:
+        return f"{float(number):,.2f}"
+    except (TypeError, ValueError):
+        return "—"
+
+
+def change_text(current, previous, percent=True) -> str:
+    """🟢/🔴/⚪ تغییر نسبت به روز قبل."""
+    if current is None or previous is None:
+        return "⚪ —"
+
+    try:
+        current = float(current)
+        previous = float(previous)
+    except (TypeError, ValueError):
+        return "⚪ —"
+
+    diff = current - previous
+
+    if diff > 0:
+        icon = "🟢"
+        sign = "+"
+    elif diff < 0:
+        icon = "🔴"
+        sign = ""
+    else:
+        return "⚪ 0"
+
+    result = f"{icon} {sign}{diff:,.0f}"
+
+    if percent and previous != 0:
+        pct = (diff / previous) * 100
+        result += f" ({sign}{pct:.2f}٪)"
+
+    return result
+
+
+def change_usd_text(current, previous) -> str:
+    if current is None or previous is None:
+        return "⚪ —"
+
+    try:
+        current = float(current)
+        previous = float(previous)
+    except (TypeError, ValueError):
+        return "⚪ —"
+
+    diff = current - previous
+
+    if diff > 0:
+        icon = "🟢"
+        sign = "+"
+    elif diff < 0:
+        icon = "🔴"
+        sign = ""
+    else:
+        return "⚪ 0"
+
+    result = f"{icon} {sign}{diff:,.2f}"
+
+    if previous != 0:
+        pct = (diff / previous) * 100
+        result += f" ({sign}{pct:.2f}٪)"
+
+    return result
 
 
 # =========================================================
@@ -124,9 +308,7 @@ async def get_rows(
 ) -> list[list[str]]:
 
     async with session.get(url) as response:
-
         response.raise_for_status()
-
         html = await response.text()
 
     soup = BeautifulSoup(
@@ -137,7 +319,6 @@ async def get_rows(
     rows = []
 
     for tr in soup.find_all("tr"):
-
         cells = [
             cell.get_text(
                 " ",
@@ -161,7 +342,6 @@ async def get_rows(
 def parse_currency(
     rows: list[list[str]],
 ) -> dict:
-    """قیمت یورو را از الن‌چند می‌خواند؛ دلار از TGJU دریافت می‌شود."""
 
     output = {}
 
@@ -187,8 +367,13 @@ def parse_currency(
     return output
 
 
-async def get_tgju_dollar(session: aiohttp.ClientSession) -> int:
-    """قیمت دلار آزاد را از متن «نرخ فعلی» در TGJU می‌خواند."""
+# =========================================================
+# TGJU DOLLAR
+# =========================================================
+
+async def get_tgju_dollar(
+    session: aiohttp.ClientSession,
+) -> int:
 
     async with session.get(URL_TGJU_DOLLAR) as response:
         response.raise_for_status()
@@ -197,8 +382,6 @@ async def get_tgju_dollar(session: aiohttp.ClientSession) -> int:
     soup = BeautifulSoup(html, "html.parser")
     page_text = soup.get_text(" ", strip=True)
 
-    # مهم: از info-price عمومی استفاده نمی‌کنیم؛ ممکن است متعلق به
-    # یک ابزارک دیگر باشد. عدد را مستقیماً پس از «نرخ فعلی» می‌خوانیم.
     match = re.search(
         r"نرخ\s*فعلی\s*[:：]+\s*([\d,٬٫]+)",
         page_text,
@@ -206,17 +389,21 @@ async def get_tgju_dollar(session: aiohttp.ClientSession) -> int:
     )
 
     if not match:
-        raise ValueError("فیلد «نرخ فعلی» دلار در صفحه TGJU پیدا نشد")
+        raise ValueError(
+            "فیلد «نرخ فعلی» دلار در صفحه TGJU پیدا نشد"
+        )
 
     rial_price = to_int(match.group(1))
 
     if rial_price is None:
-        raise ValueError("عدد نرخ فعلی دلار قابل خواندن نیست")
+        raise ValueError(
+            "عدد نرخ فعلی دلار قابل خواندن نیست"
+        )
 
-    # در صفحه TGJU واحد پولی «ریال» است؛ تبدیل به تومان.
     if rial_price < 1_000_000:
         raise ValueError(
-            f"عدد دریافتی برای نرخ دلار غیرمنتظره است: {rial_price} ریال"
+            f"عدد دریافتی برای نرخ دلار غیرمنتظره است: "
+            f"{rial_price} ریال"
         )
 
     return rial_price // 10
@@ -233,26 +420,18 @@ def parse_crypto(
     output = {}
 
     for row in rows:
-
         if len(row) < 3:
             continue
 
         name = row[0].strip().upper()
 
         if name.endswith("USDT"):
-
-            output["usdt"] = irr_to_toman(
-                row[1]
-            )
+            output["usdt"] = irr_to_toman(row[1])
 
         elif name.endswith("BTC"):
-
-            output["btc"] = usd_value(
-                row[2]
-            )
+            output["btc"] = usd_value_number(row[2])
 
     if not output:
-
         raise ValueError(
             "قیمت رمزارز پیدا نشد"
         )
@@ -271,32 +450,21 @@ def parse_gold(
     output = {}
 
     for row in rows:
-
         if len(row) < 2:
             continue
 
         name = row[0].strip().lower()
 
         if name.startswith("18k gold"):
-
-            output["gold18"] = irr_to_toman(
-                row[1]
-            )
+            output["gold18"] = irr_to_toman(row[1])
 
         elif name.startswith("full coin"):
-
-            output["coin"] = irr_to_toman(
-                row[1]
-            )
+            output["coin"] = irr_to_toman(row[1])
 
         elif name.startswith("gold ounce"):
-
-            output["ounce"] = usd_value(
-                row[1]
-            )
+            output["ounce"] = usd_value_number(row[1])
 
     if not output:
-
         raise ValueError(
             "قیمت طلا پیدا نشد"
         )
@@ -309,7 +477,10 @@ def parse_gold(
 # =========================================================
 
 async def fetch_all() -> dict:
-    timeout = aiohttp.ClientTimeout(total=25)
+    timeout = aiohttp.ClientTimeout(
+        total=25
+    )
+
     connector = aiohttp.TCPConnector(
         limit=10,
         ttl_dns_cache=300,
@@ -320,53 +491,100 @@ async def fetch_all() -> dict:
         timeout=timeout,
         connector=connector,
     ) as session:
+
         results = await asyncio.gather(
-            get_rows(session, URL_CURRENCY),
-            get_rows(session, URL_CRYPTO),
-            get_rows(session, URL_GOLD),
-            get_tgju_dollar(session),
+            get_rows(
+                session,
+                URL_CURRENCY,
+            ),
+            get_rows(
+                session,
+                URL_CRYPTO,
+            ),
+            get_rows(
+                session,
+                URL_GOLD,
+            ),
+            get_tgju_dollar(
+                session
+            ),
             return_exceptions=True,
         )
 
     data = {}
+
     parsers = (
         ("currency", parse_currency),
         ("crypto", parse_crypto),
         ("gold", parse_gold),
     )
 
-    for (key, parser), result in zip(parsers, results[:3]):
+    for (key, parser), result in zip(
+        parsers,
+        results[:3],
+    ):
+
         try:
-            if isinstance(result, Exception):
+            if isinstance(
+                result,
+                Exception,
+            ):
                 raise result
+
             data[key] = parser(result)
+
         except Exception as error:
+
             logging.warning(
                 "%s failed: %s: %s",
                 key,
                 type(error).__name__,
                 error,
             )
+
             data[key] = None
 
     try:
         dollar_result = results[3]
-        if isinstance(dollar_result, Exception):
+
+        if isinstance(
+            dollar_result,
+            Exception,
+        ):
             raise dollar_result
+
         data["tgju_dollar"] = dollar_result
+
     except Exception as error:
+
         logging.warning(
             "TGJU dollar failed: %s: %s",
             type(error).__name__,
             error,
         )
+
         data["tgju_dollar"] = None
 
     if all(
         data.get(key) is None
-        for key in ("currency", "crypto", "gold", "tgju_dollar")
+        for key in (
+            "currency",
+            "crypto",
+            "gold",
+            "tgju_dollar",
+        )
     ):
-        raise ValueError("هیچ قیمتی دریافت نشد")
+        raise ValueError(
+            "هیچ قیمتی دریافت نشد"
+        )
+
+    # ذخیره قیمت‌های دریافت‌شده برای امروز
+    try:
+        await save_daily_prices(data)
+    except Exception:
+        logging.exception(
+            "Could not save daily prices"
+        )
 
     return data
 
@@ -375,15 +593,24 @@ async def fetch_all() -> dict:
 # BUILD BOT MESSAGE
 # =========================================================
 
-def build_text(
+async def build_text(
     data: dict,
 ) -> str:
 
     now = datetime.now(
-        ZoneInfo("Asia/Tehran")
+        TEHRAN
     ).strftime(
         "%Y/%m/%d | %H:%M:%S"
     )
+
+    previous = {}
+
+    try:
+        previous = await get_yesterday_prices()
+    except Exception:
+        logging.exception(
+            "Could not load yesterday prices"
+        )
 
     currency = (
         data.get("currency")
@@ -400,7 +627,9 @@ def build_text(
         or {}
     )
 
-    usd = data.get("tgju_dollar")
+    usd = data.get(
+        "tgju_dollar"
+    )
 
     eur = currency.get(
         "euro"
@@ -408,22 +637,26 @@ def build_text(
 
     lines = [
         "📊 <b>قیمت لحظه‌ای بازار</b>",
+        "<i>مقایسه با آخرین قیمت ثبت‌شده روز قبل</i>",
         "",
     ]
 
     # -------------------------
-    # DOLLAR - TGJU
+    # DOLLAR
     # -------------------------
 
     if usd is not None:
         lines.extend([
-            "💵 <b>دلار آزاد (TGJU)</b>",
-            f"   قیمت: <b>{usd:,}</b> تومان",
+            "💵 <b>دلار آزاد</b>",
+            (
+                f"   <b>{fmt_toman(usd)}</b> تومان  "
+                f"{change_text(usd, previous.get('dollar'))}"
+            ),
             "",
         ])
     else:
         lines.extend([
-            "💵 <b>دلار آزاد (TGJU):</b> —",
+            "💵 <b>دلار آزاد:</b> —",
             "",
         ])
 
@@ -432,22 +665,21 @@ def build_text(
     # -------------------------
 
     if eur:
+        euro_sell = eur.get("sell")
 
         lines.extend([
             "💶 <b>یورو</b>",
             (
-                f"   خرید: "
-                f"<b>{eur['buy']:,}</b> تومان"
+                f"   خرید: <b>{fmt_toman(eur.get('buy'))}</b> تومان"
             ),
             (
-                f"   فروش: "
-                f"<b>{eur['sell']:,}</b> تومان"
+                f"   فروش: <b>{fmt_toman(euro_sell)}</b> تومان  "
+                f"{change_text(euro_sell, previous.get('euro'))}"
             ),
             "",
         ])
 
     else:
-
         lines.extend([
             "💶 <b>یورو:</b> —",
             "",
@@ -457,32 +689,27 @@ def build_text(
     # USDT
     # -------------------------
 
-    usdt = crypto.get(
-        "usdt"
-    )
+    usdt = crypto.get("usdt")
 
     lines.append(
         "💲 <b>تتر:</b> "
-        f"{fmt_toman(usdt)} تومان"
+        f"{fmt_toman(usdt)} تومان  "
+        f"{change_text(usdt, previous.get('usdt'))}"
     )
 
     # -------------------------
     # BITCOIN
     # -------------------------
 
-    btc = crypto.get(
-        "btc"
-    )
+    btc = crypto.get("btc")
 
-    if btc:
-
+    if btc is not None:
         lines.append(
             f"₿ <b>بیت‌کوین:</b> "
-            f"{btc} دلار"
+            f"{fmt_usd(btc)} دلار  "
+            f"{change_usd_text(btc, previous.get('btc'))}"
         )
-
     else:
-
         lines.append(
             "₿ <b>بیت‌کوین:</b> —"
         )
@@ -493,46 +720,39 @@ def build_text(
     # GOLD
     # -------------------------
 
-    gold18 = gold.get(
-        "gold18"
-    )
+    gold18 = gold.get("gold18")
 
     lines.append(
-        "🥇 <b>طلای ۱۸ عیار "
-        "(هر گرم):</b> "
-        f"{fmt_toman(gold18)} تومان"
+        "🥇 <b>طلای ۱۸ عیار (هر گرم):</b> "
+        f"{fmt_toman(gold18)} تومان  "
+        f"{change_text(gold18, previous.get('gold18'))}"
     )
 
     # -------------------------
     # COIN
     # -------------------------
 
-    coin = gold.get(
-        "coin"
-    )
+    coin = gold.get("coin")
 
     lines.append(
         "🪙 <b>سکه تمام:</b> "
-        f"{fmt_toman(coin)} تومان"
+        f"{fmt_toman(coin)} تومان  "
+        f"{change_text(coin, previous.get('coin'))}"
     )
 
     # -------------------------
     # GOLD OUNCE
     # -------------------------
 
-    ounce = gold.get(
-        "ounce"
-    )
+    ounce = gold.get("ounce")
 
-    if ounce:
-
+    if ounce is not None:
         lines.append(
             f"🌍 <b>اونس جهانی طلا:</b> "
-            f"{ounce} دلار"
+            f"{fmt_usd(ounce)} دلار  "
+            f"{change_usd_text(ounce, previous.get('ounce'))}"
         )
-
     else:
-
         lines.append(
             "🌍 <b>اونس جهانی طلا:</b> —"
         )
@@ -543,10 +763,7 @@ def build_text(
         "📡 <b>منبع دلار:</b> tgju.org",
         "📡 <b>منبع سایر قیمت‌ها:</b> alanchand.com",
         "",
-        (
-            "<i>قیمت‌ها ممکن است با "
-            "تأخیر منبع همراه باشند.</i>"
-        ),
+        "<i>🟢 افزایش | 🔴 کاهش | ⚪ بدون تغییر/بدون سابقه</i>",
     ])
 
     return "\n".join(lines)
@@ -595,7 +812,7 @@ async def cmd_price(
         data = await fetch_all()
 
         await wait.edit_text(
-            build_text(data),
+            await build_text(data),
             reply_markup=refresh_keyboard(),
             parse_mode="HTML",
         )
@@ -636,7 +853,7 @@ async def on_refresh(
 
         data = await fetch_all()
 
-        text = build_text(data)
+        text = await build_text(data)
 
         await call.message.edit_text(
             text,
@@ -691,6 +908,8 @@ async def on_refresh(
 
 async def main():
 
+    await init_db()
+
     if PROXY_URL:
 
         logging.info(
@@ -727,6 +946,9 @@ async def main():
     finally:
 
         await bot.session.close()
+
+        if db_pool is not None:
+            await db_pool.close()
 
 
 # =========================================================
