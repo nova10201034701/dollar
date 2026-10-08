@@ -401,7 +401,7 @@ async def build_text(data: dict) -> str:
 
     lines = [
         "📊 <b>قیمت لحظه‌ای بازار</b>",
-        "<i>مقایسه با آخرین قیمت ثبت‌شده 5 دقیقه  پیش</i>",
+        "<i>مقایسه با آخرین قیمت ثبت‌شده روز قبل</i>",
         "",
     ]
 
@@ -463,7 +463,7 @@ async def cmd_price(message: Message):
         inline_keyboard=[
             [
                 InlineKeyboardButton(text="🔄 بروزرسانی", callback_data="refresh_prices", style=ButtonStyle.SUCCESS),
-                InlineKeyboardButton(text="🌐 ورود به مینی‌اپ", web_app=WebAppInfo(url=web_app_url)) style=ButtonStyle.SUCCESS
+                InlineKeyboardButton(text="🌐 ورود به مینی‌اپ", web_app=WebAppInfo(url=web_app_url))
             ]
         ]
     )
