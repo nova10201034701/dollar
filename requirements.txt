@@ -1,6 +1,6 @@
-aiogram==3.3.0
-aiohttp
-beautifulsoup4
-asyncpg
-uvicorn
+aiogram>=3.15.0
 fastapi
+uvicorn
+asyncpg
+beautifulsoup4
+aiohttp
