@@ -489,7 +489,7 @@ async def on_refresh(call: CallbackQuery):
             inline_keyboard=[
                 [
                     InlineKeyboardButton(text="🔄 بروزرسانی", callback_data="refresh_prices", style=ButtonStyle.SUCCESS),
-                    InlineKeyboardButton(text="🌐 ورود به مینی‌اپ", web_app=WebAppInfo(url=web_app_url), style="primary")
+                    InlineKeyboardButton(text="🌐 ورود به مینی‌اپ", web_app=WebAppInfo(url=web_app_url))
                 ]
             ]
         )
@@ -503,7 +503,7 @@ async def on_refresh(call: CallbackQuery):
 
 
 # =========================================================
-# RUNNERS (WEB SERVER + BOT + HOURLY UPDATER)
+# RUNNERS (WEB SERVER + BOT + 5-MIN UPDATER)
 # =========================================================
 
 async def run_web_server():
@@ -516,11 +516,11 @@ async def run_web_server():
 async def scheduled_price_updater():
     while True:
         try:
-            # هر ۳۶۰۰ ثانیه (یک ساعت) یک‌بار قیمت‌ها را به صورت خودکار می‌گیرد و ذخیره می‌کند
-            await asyncio.sleep(3600)
-            logging.info("شروع به‌روزرسانی خودکار و ساعتی قیمت‌ها در پس‌زمینه...")
+            # هر ۳۰۰ ثانیه (معادل ۵ دقیقه) یک‌بار قیمت‌ها به طور خودکار آپدیت می‌شوند
+            await asyncio.sleep(300)
+            logging.info("شروع به‌روزرسانی خودکار قیمت‌ها (هر ۵ دقیقه)...")
             await fetch_all()
-            logging.info("به‌روزرسانی خودکار و ساعتی قیمت‌ها با موفقیت انجام شد.")
+            logging.info("به‌روزرسانی خودکار قیمت‌ها با موفقیت انجام شد.")
         except Exception as e:
             logging.error(f"خطا در تسک به‌روزرسانی خودکار: {e}")
 
@@ -532,7 +532,7 @@ async def main():
     bot = Bot(token=BOT_TOKEN, session=session)
 
     try:
-        logging.info("Bot, Web Server and Scheduled Updater are starting concurrently...")
+        logging.info("Bot, Web Server and 5-min Updater are starting concurrently...")
         await asyncio.gather(
             run_web_server(),
             dp.start_polling(bot),
