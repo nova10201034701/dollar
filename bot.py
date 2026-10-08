@@ -98,28 +98,30 @@ async def init_db():
             """
         )
 
-        # اولین قیمت ثبت‌شده هر نماد در هر روز؛
-        # اگر سابقه دیروز موجود نباشد، برای مقایسه همان روز استفاده می‌شود.
         await conn.execute(
             """
-            CREATE TABLE IF NOT EXISTS daily_open_prices (
-                price_date DATE NOT NULL,
+            CREATE TABLE IF NOT EXISTS price_snapshots (
+                id BIGSERIAL PRIMARY KEY,
                 symbol TEXT NOT NULL,
                 value DOUBLE PRECISION NOT NULL,
-                recorded_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                PRIMARY KEY (price_date, symbol)
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             )
             """
         )
+        await conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_price_snapshots_symbol_time
+            ON price_snapshots (symbol, created_at DESC)
+            """
+        )
 
-    logging.info("PostgreSQL database (price_history + daily_open_prices) is ready.")
 
 
-async def update_and_get_prices() -> dict:
-    """
-    سایت‌ها را اسکرپ می‌کند، آخرین قیمت ثبت‌شده در دیتابیس را می‌خواند؛
-    اگر قیمت تغییر کرده باشد، آن را ثبت می‌کند و در غیر این صورت رکورد جدید نمی‌سازد.
-    """
+    logging.info("PostgreSQL database (price_history + price_snapshots) is ready.")
+
+
+async def update_and_get_prices(record_snapshot: bool = True) -> dict:
+    """دریافت قیمت‌ها و مقایسه با آخرین snapshot پنج‌دقیقه‌ای قبلی."""
     timeout = aiohttp.ClientTimeout(total=25)
     connector = aiohttp.TCPConnector(limit=10, ttl_dns_cache=300)
 
@@ -134,13 +136,13 @@ async def update_and_get_prices() -> dict:
 
     raw_data = {}
     parsers = (("currency", parse_currency), ("crypto", parse_crypto), ("gold", parse_gold))
-
     for (key, parser), result in zip(parsers, results[:3]):
         try:
             if isinstance(result, Exception):
                 raise result
             raw_data[key] = parser(result)
         except Exception:
+            logging.exception(f"خطا در دریافت/پردازش {key}")
             raw_data[key] = None
 
     try:
@@ -148,15 +150,12 @@ async def update_and_get_prices() -> dict:
             raise results[3]
         raw_data["tgju_dollar"] = results[3]
     except Exception:
+        logging.exception("خطا در دریافت دلار TGJU")
         raw_data["tgju_dollar"] = None
 
     current_prices = {
         "dollar": raw_data.get("tgju_dollar"),
-        "euro": (
-            raw_data.get("currency", {}).get("euro", {}).get("sell")
-            if raw_data.get("currency")
-            else None
-        ),
+        "euro": raw_data.get("currency", {}).get("euro", {}).get("sell") if raw_data.get("currency") else None,
         "usdt": raw_data.get("crypto", {}).get("usdt"),
         "btc": raw_data.get("crypto", {}).get("btc"),
         "gold18": raw_data.get("gold", {}).get("gold18"),
@@ -164,118 +163,75 @@ async def update_and_get_prices() -> dict:
         "ounce": raw_data.get("gold", {}).get("ounce"),
     }
 
-    result_data = {
-        "raw": raw_data,
-        "comparison": {}
-    }
-
+    result_data = {"raw": raw_data, "comparison": {}}
     if db_pool is None:
         return result_data
 
     async with db_pool.acquire() as conn:
-        # ---------------------------------------------------------
-        # مرجع مقایسه:
-        # 1) اگر از روزهای قبل سابقه داریم، آخرین روز قبل از امروز
-        # 2) اگر نداریم، اولین قیمت ثبت‌شده امروز
-        # ---------------------------------------------------------
-        today = datetime.now(TEHRAN).date()
-
-        yesterday_rows = await conn.fetch(
+        # آخرین snapshot قبلی، حتی اگر قیمت هیچ تغییری نکرده باشد.
+        rows = await conn.fetch(
             """
-            SELECT DISTINCT ON (symbol) symbol, value
-            FROM price_history
-            WHERE (created_at AT TIME ZONE 'Asia/Tehran')::date < $1
+            SELECT DISTINCT ON (symbol) symbol, value, created_at
+            FROM price_snapshots
             ORDER BY symbol, created_at DESC
-            """,
-            today,
+            """
         )
+        previous_snapshot = {row["symbol"]: float(row["value"]) for row in rows}
 
-        comparison_prices = {
-            row["symbol"]: float(row["value"])
-            for row in yesterday_rows
-        }
-
-        comparison_label = "دیروز"
-
-        if not comparison_prices:
-            open_rows = await conn.fetch(
-                """
-                SELECT symbol, value
-                FROM daily_open_prices
-                WHERE price_date = $1
-                """,
-                today,
-            )
-
-            comparison_prices = {
-                row["symbol"]: float(row["value"])
-                for row in open_rows
-            }
-            comparison_label = "اولین قیمت امروز"
-
-        result_data["comparison_label"] = comparison_label
-
+        # اول مقایسه می‌کنیم، بعد snapshot جدید را ذخیره می‌کنیم.
         for symbol, val in current_prices.items():
             if val is None:
                 continue
-
             try:
                 numeric_val = float(val)
             except (TypeError, ValueError):
                 continue
 
-            # اولین قیمت امروز را فقط یک بار ذخیره کن.
-            await conn.execute(
-                """
-                INSERT INTO daily_open_prices (price_date, symbol, value)
-                VALUES ($1, $2, $3)
-                ON CONFLICT (price_date, symbol) DO NOTHING
-                """,
-                today,
-                symbol,
-                numeric_val,
-            )
-
-            old_val = comparison_prices.get(symbol)
-
-            # اگر قیمت تغییر کرده باشد، در تاریخچه ثبتش کن.
-            rows = await conn.fetch(
-                """
-                SELECT value
-                FROM price_history
-                WHERE symbol = $1
-                ORDER BY created_at DESC
-                LIMIT 1
-                """,
-                symbol,
-            )
-
-            last_db_val = float(rows[0]["value"]) if rows else None
-
-            if last_db_val is None or numeric_val != last_db_val:
-                await conn.execute(
-                    """
-                    INSERT INTO price_history (symbol, value, created_at)
-                    VALUES ($1, $2, NOW())
-                    """,
-                    symbol,
-                    numeric_val,
-                )
-                logging.info(
-                    f"تغییر قیمت برای {symbol}: "
-                    f"از {last_db_val} به {numeric_val} (ثبت شد)"
-                )
-
-            # برای همان لحظه، مقایسه را با مرجع روزانه انجام بده.
+            old_val = previous_snapshot.get(symbol)
             result_data["comparison"][symbol] = {
                 "current": numeric_val,
                 "previous": old_val if old_val is not None else numeric_val,
             }
 
-            # اگر این اولین قیمت امروز است، همان را به عنوان مرجع
-            # برای دفعات بعدی همین روز نگه می‌داریم.
-            if old_val is None:
-                result_data["comparison"][symbol]["previous"] = numeric_val
+        # فقط تسک خودکار snapshot می‌سازد؛ رفرش دستی تایمر ۵ دقیقه‌ای را جابه‌جا نمی‌کند.
+        if record_snapshot:
+            for symbol, val in current_prices.items():
+                if val is None:
+                    continue
+                try:
+                    numeric_val = float(val)
+                except (TypeError, ValueError):
+                    continue
+
+                await conn.execute(
+                    """
+                    INSERT INTO price_snapshots (symbol, value, created_at)
+                    VALUES ($1, $2, NOW())
+                    """,
+                    symbol, numeric_val,
+                )
+
+                # price_history همچنان برای API و تاریخچه تغییرات نگه داشته می‌شود.
+                last_row = await conn.fetchrow(
+                    """
+                    SELECT value FROM price_history
+                    WHERE symbol = $1
+                    ORDER BY created_at DESC
+                    LIMIT 1
+                    """,
+                    symbol,
+                )
+                last_value = float(last_row["value"]) if last_row else None
+
+                if last_value is None or numeric_val != last_value:
+                    await conn.execute(
+                        """
+                        INSERT INTO price_history (symbol, value, created_at)
+                        VALUES ($1, $2, NOW())
+                        """,
+                        symbol, numeric_val,
+                    )
+        logging.info("مقایسه با snapshot قبلی انجام شد و snapshot جدید ثبت شد.")
 
     return result_data
 
@@ -553,7 +509,7 @@ async def cmd_price(message: Message):
 
     wait = await message.answer("⏳ در حال دریافت آخرین قیمت‌ها...")
     try:
-        data = await update_and_get_prices()
+        data = await update_and_get_prices(record_snapshot=False)
         await wait.edit_text(await build_text(data), reply_markup=keyboard, parse_mode="HTML")
     except Exception:
         await wait.edit_text("❌ دریافت قیمت‌ها ناموفق بود. لطفاً دوباره تلاش کنید.")
@@ -563,7 +519,7 @@ async def cmd_price(message: Message):
 async def on_refresh(call: CallbackQuery):
     try:
         await call.answer("⏳ در حال بروزرسانی...")
-        data = await update_and_get_prices()
+        data = await update_and_get_prices(record_snapshot=False)
         
         raw_url = os.environ.get("WEB_APP_URL", "dollar-production-82c0.up.railway.app")
         web_app_url = raw_url if raw_url.startswith("http") else f"https://{raw_url}"
@@ -601,14 +557,21 @@ async def scheduled_price_updater():
         try:
             await asyncio.sleep(300)  # هر ۵ دقیقه
             logging.info("بررسی خودکار قیمت‌ها برای ثبت تغییرات...")
-            await update_and_get_prices()
-            logging.info("بررسی خودکار به پایان رسید.")
+            await update_and_get_prices(record_snapshot=True)
+            logging.info("بررسی خودکار ۵ دقیقه‌ای به پایان رسید.")
         except Exception as e:
             logging.error(f"خطا در تسک به‌روزرسانی خودکار: {e}")
 
 
 async def main():
     await init_db()
+
+    # یک snapshot اولیه می‌سازیم تا اولین مقایسه بعد از ۵ دقیقه انجام شود.
+    try:
+        await update_and_get_prices(record_snapshot=True)
+        logging.info("Snapshot اولیه ثبت شد؛ مقایسه‌های ۵ دقیقه‌ای از اینجا شروع می‌شوند.")
+    except Exception:
+        logging.exception("ثبت snapshot اولیه ناموفق بود")
 
     session = AiohttpSession(proxy=PROXY_URL) if PROXY_URL else AiohttpSession()
     bot = Bot(token=BOT_TOKEN, session=session)
