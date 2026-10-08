@@ -456,14 +456,14 @@ async def build_text(data: dict) -> str:
 
 @dp.message(Command("start", "dollar", "price"))
 async def cmd_price(message: Message):
-    # گرفتن دامین از متغیرهای محیطی یا حالت پیش‌فرض برای دکمه مینی‌اپ
-    web_app_url = os.environ.get("WEB_APP_URL", "https://dollar-production-a967.up.railway.app/")
+    raw_url = os.environ.get("WEB_APP_URL", "dollar-production-82c0.up.railway.app")
+    web_app_url = raw_url if raw_url.startswith("http") else f"https://{raw_url}"
     
     keyboard = InlineKeyboardMarkup(
         inline_keyboard=[
             [
                 InlineKeyboardButton(text="🔄 بروزرسانی", callback_data="refresh_prices", style=ButtonStyle.SUCCESS),
-                InlineKeyboardButton(text="🌐 ورود به مینی‌اپ", web_app=WebAppInfo(url=web_app_url), style=ButtonStyle.DANGER)
+                InlineKeyboardButton(text="🌐 ورود به مینی‌اپ", web_app=WebAppInfo(url=web_app_url))
             ]
         ]
     )
@@ -482,12 +482,14 @@ async def on_refresh(call: CallbackQuery):
         await call.answer("⏳ در حال بروزرسانی...")
         data = await fetch_all()
         
-        web_app_url = os.environ.get("WEB_APP_URL", "https://your-domain.railway.app")
+        raw_url = os.environ.get("WEB_APP_URL", "dollar-production-82c0.up.railway.app")
+        web_app_url = raw_url if raw_url.startswith("http") else f"https://{raw_url}"
+        
         keyboard = InlineKeyboardMarkup(
             inline_keyboard=[
                 [
                     InlineKeyboardButton(text="🔄 بروزرسانی", callback_data="refresh_prices", style=ButtonStyle.SUCCESS),
-                   InlineKeyboardButton(text="🌐 ورود به مینی‌اپ", web_app=WebAppInfo(url=web_app_url), style="primary")
+                    InlineKeyboardButton(text="🌐 ورود به مینی‌اپ", web_app=WebAppInfo(url=web_app_url), style="primary")
                 ]
             ]
         )
@@ -501,7 +503,7 @@ async def on_refresh(call: CallbackQuery):
 
 
 # =========================================================
-# RUNNERS (WEB SERVER + BOT)
+# RUNNERS (WEB SERVER + BOT + HOURLY UPDATER)
 # =========================================================
 
 async def run_web_server():
@@ -511,6 +513,18 @@ async def run_web_server():
     await server.serve()
 
 
+async def scheduled_price_updater():
+    while True:
+        try:
+            # هر ۳۶۰۰ ثانیه (یک ساعت) یک‌بار قیمت‌ها را به صورت خودکار می‌گیرد و ذخیره می‌کند
+            await asyncio.sleep(3600)
+            logging.info("شروع به‌روزرسانی خودکار و ساعتی قیمت‌ها در پس‌زمینه...")
+            await fetch_all()
+            logging.info("به‌روزرسانی خودکار و ساعتی قیمت‌ها با موفقیت انجام شد.")
+        except Exception as e:
+            logging.error(f"خطا در تسک به‌روزرسانی خودکار: {e}")
+
+
 async def main():
     await init_db()
 
@@ -518,10 +532,11 @@ async def main():
     bot = Bot(token=BOT_TOKEN, session=session)
 
     try:
-        logging.info("Bot and Web Server are starting concurrently...")
+        logging.info("Bot, Web Server and Scheduled Updater are starting concurrently...")
         await asyncio.gather(
             run_web_server(),
-            dp.start_polling(bot)
+            dp.start_polling(bot),
+            scheduled_price_updater()
         )
     finally:
         await bot.session.close()
