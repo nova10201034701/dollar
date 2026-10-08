@@ -463,7 +463,7 @@ async def cmd_price(message: Message):
         inline_keyboard=[
             [
                 InlineKeyboardButton(text="🔄 بروزرسانی", callback_data="refresh_prices", style=ButtonStyle.SUCCESS),
-                InlineKeyboardButton(text="🌐 ورود به مینی‌اپ", web_app=WebAppInfo(url=web_app_url), style="danger")
+                InlineKeyboardButton(text="🌐 ورود به مینی‌اپ", web_app=WebAppInfo(url=web_app_url), style=ButtonStyle.DANGER)
             ]
         ]
     )
