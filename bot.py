@@ -63,11 +63,8 @@ TEHRAN = ZoneInfo("Asia/Tehran")
 dp = Dispatcher()
 app = FastAPI()
 
-# کش برای نگهداری قیمت‌های ۵ دقیقه قبل جهت مقایسه فوری
-last_prices_cache = {}
-
 # =========================================================
-# DATABASE
+# DATABASE (PRICE HISTORY LOG)
 # =========================================================
 
 db_pool: asyncpg.Pool | None = None
@@ -86,62 +83,118 @@ async def init_db():
     async with db_pool.acquire() as conn:
         await conn.execute(
             """
-            CREATE TABLE IF NOT EXISTS daily_prices (
-                price_date DATE NOT NULL,
+            CREATE TABLE IF NOT EXISTS price_history (
+                id SERIAL PRIMARY KEY,
                 symbol TEXT NOT NULL,
                 value DOUBLE PRECISION NOT NULL,
-                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                PRIMARY KEY (price_date, symbol)
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             )
             """
         )
+        await conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_price_history_symbol_time 
+            ON price_history (symbol, created_at DESC)
+            """
+        )
 
-    logging.info("PostgreSQL database is ready.")
+    logging.info("PostgreSQL database (price_history) is ready.")
 
 
-async def save_daily_prices(data: dict):
-    if db_pool is None:
-        return
+async def update_and_get_prices() -> dict:
+    """
+    سایت‌ها را اسکرپ می‌کند، آخرین قیمت ثبت‌شده در دیتابیس را می‌خواند؛
+    اگر قیمت تغییر کرده باشد، آن را ثبت می‌کند و در غیر این صورت رکورد جدید نمی‌سازد.
+    """
+    timeout = aiohttp.ClientTimeout(total=25)
+    connector = aiohttp.TCPConnector(limit=10, ttl_dns_cache=300)
 
-    today = datetime.now(TEHRAN).date()
+    async with aiohttp.ClientSession(headers=HEADERS, timeout=timeout, connector=connector) as session:
+        results = await asyncio.gather(
+            get_rows(session, URL_CURRENCY),
+            get_rows(session, URL_CRYPTO),
+            get_rows(session, URL_GOLD),
+            get_tgju_dollar(session),
+            return_exceptions=True,
+        )
 
-    prices = {
-        "dollar": data.get("tgju_dollar"),
+    raw_data = {}
+    parsers = (("currency", parse_currency), ("crypto", parse_crypto), ("gold", parse_gold))
+
+    for (key, parser), result in zip(parsers, results[:3]):
+        try:
+            if isinstance(result, Exception):
+                raise result
+            raw_data[key] = parser(result)
+        except Exception:
+            raw_data[key] = None
+
+    try:
+        if isinstance(results[3], Exception):
+            raise results[3]
+        raw_data["tgju_dollar"] = results[3]
+    except Exception:
+        raw_data["tgju_dollar"] = None
+
+    current_prices = {
+        "dollar": raw_data.get("tgju_dollar"),
         "euro": (
-            data.get("currency", {}).get("euro", {}).get("sell")
-            if data.get("currency")
+            raw_data.get("currency", {}).get("euro", {}).get("sell")
+            if raw_data.get("currency")
             else None
         ),
-        "usdt": data.get("crypto", {}).get("usdt"),
-        "btc": data.get("crypto", {}).get("btc"),
-        "gold18": data.get("gold", {}).get("gold18"),
-        "coin": data.get("gold", {}).get("coin"),
-        "ounce": data.get("gold", {}).get("ounce"),
+        "usdt": raw_data.get("crypto", {}).get("usdt"),
+        "btc": raw_data.get("crypto", {}).get("btc"),
+        "gold18": raw_data.get("gold", {}).get("gold18"),
+        "coin": raw_data.get("gold", {}).get("coin"),
+        "ounce": raw_data.get("gold", {}).get("ounce"),
     }
 
-    async with db_pool.acquire() as conn:
-        for symbol, value in prices.items():
-            if value is None:
-                continue
+    result_data = {
+        "raw": raw_data,
+        "comparison": {}
+    }
 
+    if db_pool is None:
+        return result_data
+
+    async with db_pool.acquire() as conn:
+        # گرفتن آخرین قیمت ثبت شده هر نماد در دیتابیس
+        rows = await conn.fetch("""
+            SELECT DISTINCT ON (symbol) symbol, value
+            FROM price_history
+            ORDER BY symbol, created_at DESC
+        """)
+        last_db_prices = {row["symbol"]: float(row["value"]) for row in rows}
+
+        for symbol, val in current_prices.items():
+            if val is None:
+                continue
             try:
-                numeric_value = float(value)
+                numeric_val = float(val)
             except (TypeError, ValueError):
                 continue
 
-            await conn.execute(
-                """
-                INSERT INTO daily_prices (price_date, symbol, value, updated_at)
-                VALUES ($1, $2, $3, NOW())
-                ON CONFLICT (price_date, symbol)
-                DO UPDATE SET
-                    value = EXCLUDED.value,
-                    updated_at = NOW()
-                """,
-                today,
-                symbol,
-                numeric_value,
-            )
+            old_val = last_db_prices.get(symbol)
+
+            # اگر برای اولین بار است یا قیمت تغییر کرده است، در دیتابیس ثبت کن
+            if old_val is None or numeric_val != old_val:
+                await conn.execute(
+                    """
+                    INSERT INTO price_history (symbol, value, created_at)
+                    VALUES ($1, $2, NOW())
+                    """,
+                    symbol,
+                    numeric_val,
+                )
+                logging.info(f"تغییر قیمت برای {symbol}: از {old_val} به {numeric_val} (ثبت شد)")
+
+            result_data["comparison"][symbol] = {
+                "current": numeric_val,
+                "previous": old_val if old_val is not None else numeric_val
+            }
+
+    return result_data
 
 
 # =========================================================
@@ -155,9 +208,9 @@ async def get_prices_api():
     
     async with db_pool.acquire() as conn:
         rows = await conn.fetch("""
-            SELECT symbol, value, updated_at 
-            FROM daily_prices 
-            WHERE price_date = (SELECT MAX(price_date) FROM daily_prices)
+            SELECT DISTINCT ON (symbol) symbol, value, created_at as updated_at
+            FROM price_history
+            ORDER BY symbol, created_at DESC
         """)
         return {row["symbol"]: {"value": row["value"], "updated_at": row["updated_at"]} for row in rows}
 
@@ -217,7 +270,7 @@ def fmt_usd(number) -> str:
 
 
 def change_text(current, previous, percent=True) -> str:
-    if current is None or previous is None:
+    if current is None or previous is None or current == previous:
         return "⚪ —"
     try:
         current = float(current)
@@ -231,7 +284,7 @@ def change_text(current, previous, percent=True) -> str:
     elif diff < 0:
         icon, sign = "🔴", ""
     else:
-        return "⚪ 0"
+        return "⚪ —"
 
     result = f"{icon} {sign}{diff:,.0f}"
     if percent and previous != 0:
@@ -241,7 +294,7 @@ def change_text(current, previous, percent=True) -> str:
 
 
 def change_usd_text(current, previous) -> str:
-    if current is None or previous is None:
+    if current is None or previous is None or current == previous:
         return "⚪ —"
     try:
         current = float(current)
@@ -255,7 +308,7 @@ def change_usd_text(current, previous) -> str:
     elif diff < 0:
         icon, sign = "🔴", ""
     else:
-        return "⚪ 0"
+        return "⚪ —"
 
     result = f"{icon} {sign}{diff:,.2f}"
     if previous != 0:
@@ -330,125 +383,67 @@ def parse_gold(rows: list[list[str]]) -> dict:
     return output
 
 
-async def fetch_all() -> dict:
-    timeout = aiohttp.ClientTimeout(total=25)
-    connector = aiohttp.TCPConnector(limit=10, ttl_dns_cache=300)
-
-    async with aiohttp.ClientSession(headers=HEADERS, timeout=timeout, connector=connector) as session:
-        results = await asyncio.gather(
-            get_rows(session, URL_CURRENCY),
-            get_rows(session, URL_CRYPTO),
-            get_rows(session, URL_GOLD),
-            get_tgju_dollar(session),
-            return_exceptions=True,
-        )
-
-    data = {}
-    parsers = (("currency", parse_currency), ("crypto", parse_crypto), ("gold", parse_gold))
-
-    for (key, parser), result in zip(parsers, results[:3]):
-        try:
-            if isinstance(result, Exception):
-                raise result
-            data[key] = parser(result)
-        except Exception:
-            data[key] = None
-
-    try:
-        if isinstance(results[3], Exception):
-            raise results[3]
-        data["tgju_dollar"] = results[3]
-    except Exception:
-        data["tgju_dollar"] = None
-
-    try:
-        await save_daily_prices(data)
-    except Exception:
-        pass
-
-    return data
-
-
 async def build_text(data: dict) -> str:
-    global last_prices_cache
     now = datetime.now(TEHRAN).strftime("%Y/%m/%d | %H:%M:%S")
+    comp = data.get("comparison", {})
 
-    currency = data.get("currency") or {}
-    crypto = data.get("crypto") or {}
-    gold = data.get("gold") or {}
-    usd = data.get("tgju_dollar")
-    eur = currency.get("euro")
-    euro_sell = eur.get("sell") if eur else None
-    usdt = crypto.get("usdt")
-    btc = crypto.get("btc")
-    gold18 = gold.get("gold18")
-    coin = gold.get("coin")
-    ounce = gold.get("ounce")
+    def get_diff(symbol):
+        item = comp.get(symbol)
+        if not item:
+            return None, None
+        return item["current"], item["previous"]
 
-    # مقایسه با قیمت ۵ دقیقه قبل (آپدیت قبلی)
-    prev_usd = last_prices_cache.get("dollar", usd)
-    prev_euro = last_prices_cache.get("euro", euro_sell)
-    prev_usdt = last_prices_cache.get("usdt", usdt)
-    prev_btc = last_prices_cache.get("btc", btc)
-    prev_gold18 = last_prices_cache.get("gold18", gold18)
-    prev_coin = last_prices_cache.get("coin", coin)
-    prev_ounce = last_prices_cache.get("ounce", ounce)
+    dollar_curr, dollar_prev = get_diff("dollar")
+    euro_curr, euro_prev = get_diff("euro")
+    usdt_curr, usdt_prev = get_diff("usdt")
+    btc_curr, btc_prev = get_diff("btc")
+    gold18_curr, gold18_prev = get_diff("gold18")
+    coin_curr, coin_prev = get_diff("coin")
+    ounce_curr, ounce_prev = get_diff("ounce")
 
     lines = [
         "📊 <b>قیمت لحظه‌ای بازار</b>",
-        "<i>مقایسه با ۵ دقیقه قبل</i>",
+        "<i>ثبت و مقایسه تغییرات واقعی قیمت</i>",
         "",
     ]
 
-    if usd is not None:
+    if dollar_curr is not None:
         lines.extend([
             "💵 <b>دلار آزاد</b>",
-            f"   <b>{fmt_toman(usd)}</b> تومان  {change_text(usd, prev_usd)}",
+            f"   <b>{fmt_toman(dollar_curr)}</b> تومان  {change_text(dollar_curr, dollar_prev)}",
             "",
         ])
 
-    if eur:
+    if euro_curr is not None:
         lines.extend([
-            "💶 <b>یورو</b>",
-            f"   خرید: <b>{fmt_toman(eur.get('buy'))}</b> تومان",
-            f"   فروش: <b>{fmt_toman(euro_sell)}</b> تومان  {change_text(euro_sell, prev_euro)}",
+            "💶 <b>یورو (فروش)</b>",
+            f"   <b>{fmt_toman(euro_curr)}</b> تومان  {change_text(euro_curr, euro_prev)}",
             "",
         ])
 
-    if usdt is not None:
-        lines.append(f"💲 <b>تتر:</b> {fmt_toman(usdt)} تومان  {change_text(usdt, prev_usdt)}")
+    if usdt_curr is not None:
+        lines.append(f"💲 <b>تتر:</b> {fmt_toman(usdt_curr)} تومان  {change_text(usdt_curr, usdt_prev)}")
 
-    if btc is not None:
-        lines.append(f"₿ <b>بیت‌کوین:</b> {fmt_usd(btc)} دلار  {change_usd_text(btc, prev_btc)}")
+    if btc_curr is not None:
+        lines.append(f"₿ <b>بیت‌کوین:</b> {fmt_usd(btc_curr)} دلار  {change_usd_text(btc_curr, btc_prev)}")
 
     lines.append("")
 
-    if gold18 is not None:
-        lines.append(f"🥇 <b>طلای ۱۸ عیار:</b> {fmt_toman(gold18)} تومان  {change_text(gold18, prev_gold18)}")
+    if gold18_curr is not None:
+        lines.append(f"🥇 <b>طلای ۱۸ عیار:</b> {fmt_toman(gold18_curr)} تومان  {change_text(gold18_curr, gold18_prev)}")
 
-    if coin is not None:
-        lines.append(f"🪙 <b>سکه تمام:</b> {fmt_toman(coin)} تومان  {change_text(coin, prev_coin)}")
+    if coin_curr is not None:
+        lines.append(f"🪙 <b>سکه تمام:</b> {fmt_toman(coin_curr)} تومان  {change_text(coin_curr, coin_prev)}")
 
-    if ounce is not None:
-        lines.append(f"🌍 <b>اونس جهانی طلا:</b> {fmt_usd(ounce)} دلار  {change_usd_text(ounce, prev_ounce)}")
+    if ounce_curr is not None:
+        lines.append(f"🌍 <b>اونس جهانی طلا:</b> {fmt_usd(ounce_curr)} دلار  {change_usd_text(ounce_curr, ounce_prev)}")
 
     lines.extend([
         "",
-        f"🕒 <b>آخرین دریافت:</b> {now}",
+        f"🕒 <b>آخرین بروزرسانی:</b> {now}",
         "",
         "<i>🟢 افزایش | 🔴 کاهش | ⚪ بدون تغییر</i>",
     ])
-
-    # ذخیره قیمت‌های فعلی به عنوان قیمت قبلی برای چک بعدی
-    last_prices_cache = {
-        "dollar": usd,
-        "euro": euro_sell,
-        "usdt": usdt,
-        "btc": btc,
-        "gold18": gold18,
-        "coin": coin,
-        "ounce": ounce,
-    }
 
     return "\n".join(lines)
 
@@ -473,7 +468,7 @@ async def cmd_price(message: Message):
 
     wait = await message.answer("⏳ در حال دریافت آخرین قیمت‌ها...")
     try:
-        data = await fetch_all()
+        data = await update_and_get_prices()
         await wait.edit_text(await build_text(data), reply_markup=keyboard, parse_mode="HTML")
     except Exception:
         await wait.edit_text("❌ دریافت قیمت‌ها ناموفق بود. لطفاً دوباره تلاش کنید.")
@@ -483,7 +478,7 @@ async def cmd_price(message: Message):
 async def on_refresh(call: CallbackQuery):
     try:
         await call.answer("⏳ در حال بروزرسانی...")
-        data = await fetch_all()
+        data = await update_and_get_prices()
         
         raw_url = os.environ.get("WEB_APP_URL", "dollar-production-82c0.up.railway.app")
         web_app_url = raw_url if raw_url.startswith("http") else f"https://{raw_url}"
@@ -519,10 +514,10 @@ async def run_web_server():
 async def scheduled_price_updater():
     while True:
         try:
-            await asyncio.sleep(300)
-            logging.info("شروع به‌روزرسانی خودکار قیمت‌ها (هر ۵ دقیقه)...")
-            await fetch_all()
-            logging.info("به‌روزرسانی خودکار قیمت‌ها با موفقیت انجام شد.")
+            await asyncio.sleep(300)  # هر ۵ دقیقه
+            logging.info("بررسی خودکار قیمت‌ها برای ثبت تغییرات...")
+            await update_and_get_prices()
+            logging.info("بررسی خودکار به پایان رسید.")
         except Exception as e:
             logging.error(f"خطا در تسک به‌روزرسانی خودکار: {e}")
 
@@ -534,7 +529,7 @@ async def main():
     bot = Bot(token=BOT_TOKEN, session=session)
 
     try:
-        logging.info("Bot, Web Server and 5-min Updater are starting concurrently...")
+        logging.info("Bot, Web Server and 5-min Change Tracker are starting concurrently...")
         await asyncio.gather(
             run_web_server(),
             dp.start_polling(bot),
