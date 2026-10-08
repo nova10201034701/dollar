@@ -1,4 +1,6 @@
-aiogram==3.31.0
+aiogram==3.3.0
 aiohttp
 beautifulsoup4
 asyncpg
+uvicorn
+fastapi
