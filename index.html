@@ -1,0 +1,98 @@
+<!DOCTYPE html>
+<html lang="fa" dir="rtl">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>قیمت لحظه‌ای بازار</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://telegram.org/js/telegram-web-app.js"></script>
+    <style>
+        body {
+            background-color: #0f172a;
+            color: #f8fafc;
+            font-family: system-ui, -apple-system, sans-serif;
+        }
+        .glass-card {
+            background: rgba(30, 41, 59, 0.7);
+            backdrop-filter: blur(12px);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+        }
+    </style>
+</head>
+<body class="p-4 max-w-md mx-auto min-h-screen flex flex-col justify-between">
+
+    <div>
+        <!-- هدر -->
+        <header class="text-center my-6">
+            <h1 class="text-2xl font-black bg-gradient-to-r from-blue-400 to-indigo-500 bg-clip-text text-transparent">
+                📊 قیمت لحظه‌ای بازار
+            </h1>
+            <p class="text-xs text-slate-400 mt-1">بروزرسانی هوشمند از دیتابیس اختصاصی</p>
+        </header>
+
+        <!-- لیست قیمت‌ها -->
+        <div id="price-list" class="space-y-3">
+            <div class="glass-card p-4 rounded-2xl text-center text-slate-400 animate-pulse">
+                در حال بارگذاری قیمت‌ها از سرور...
+            </div>
+        </div>
+    </div>
+
+    <!-- فوتر -->
+    <footer class="text-center text-xs text-slate-500 my-4">
+        تم دارک فضایی • متصل به Railway 🚀
+    </footer>
+
+    <script>
+        // فعال‌سازی حالت تلگرام مینی‌اپ
+        const tg = window.Telegram.WebApp;
+        tg.expand();
+
+        async function fetchPrices() {
+            try {
+                const response = await fetch('/api/prices');
+                const data = await response.json();
+                
+                const container = document.getElementById('price-list');
+                container.innerHTML = '';
+
+                const names = {
+                    'dollar': { title: '💵 دلار آزاد', unit: 'تومان' },
+                    'euro': { title: '💶 یورو', unit: 'تومان' },
+                    'usdt': { title: '💲 تتر', unit: 'تومان' },
+                    'btc': { title: '₿ بیت‌کوین', unit: 'دلار' },
+                    'gold18': { title: '🥇 طلای ۱۸ عیار', unit: 'تومان' },
+                    'coin': { title: '🪙 سکه تمام', unit: 'تومان' },
+                    'ounce': { title: '🌍 اونس جهانی', unit: 'دلار' }
+                };
+
+                for (const [key, info] of Object.entries(names)) {
+                    if (data[key]) {
+                        const val = data[key].value.toLocaleString();
+                        container.innerHTML += `
+                            <div class="glass-card p-4 rounded-2xl flex justify-between items-center shadow-lg">
+                                <span class="font-medium text-slate-200">${info.title}</span>
+                                <div class="text-left">
+                                    <span class="font-bold text-emerald-400">${val}</span>
+                                    <span class="text-xs text-slate-400 mr-1">${info.unit}</span>
+                                </div>
+                            </div>
+                        `;
+                    }
+                }
+            } catch (err) {
+                console.error(err);
+                document.getElementById('price-list').innerHTML = `
+                    <div class="glass-card p-4 rounded-2xl text-center text-rose-400">
+                        خطا در دریافت اطلاعات از سرور
+                    </div>
+                `;
+            }
+        }
+
+        fetchPrices();
+        // بروزرسانی خودکار هر ۶۰ ثانیه
+        setInterval(fetchPrices, 60000);
+    </script>
+</body>
+</html>
